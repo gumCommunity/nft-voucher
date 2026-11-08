@@ -47,6 +47,7 @@ The collection has no TON withdrawal, so no TON may get stuck on it:
 | 401 | sender is not the owner (item: also when the voucher is already burned) |
 | 402 | item: not enough TON attached to `transfer`; collection: `item_index` is not `next_item_index` |
 | 403 + n | collection batch mint: the n-th item index (from 1) is not the next one |
+| 399 | collection batch mint: more than 249 items |
 | 405 | initialization not from the collection |
 | 333 | address is not in workchain 0 |
 | 410 | collection: invalid royalty (base is 0 or more than 100%) |
@@ -113,7 +114,8 @@ Measured in the sandbox, without the TON put inside the vouchers:
 | one by one (`minter_mint` × 20) | ~0.17 TON |
 | one batch (`minter_batch_mint`) | **~0.05 TON** |
 
-Batches are capped at 100: the collection deploys ~140 items per message before hitting the gas limit.
+Batches are capped at 100: the collection deploys about 130 items per message before hitting the 1 M gas limit
+(measured: 100 items use ~727 k gas, 130 use ~1 M, 140 run out of gas).
 
 The 24-hour window starts with the first mint after the previous window ended, so in the worst case 2 × N vouchers can be
 minted within a short time around the window boundary. If the collection rejects an operator mint, the counter is restored.
@@ -138,8 +140,9 @@ as `opts.pending`: `mintPending` checks whether it landed and otherwise sends ex
 again; the collection accepts only `next_item_index`, so at most one copy is minted and the other one is refunded.
 Re-queueing those requests would mint them a second time if the first batch lands late. Save every batch in
 `opts.beforeSend` (it is called right before sending) so that a crash after sending does not lose it either; the CLI in
-the example keeps it in `pending-batch.json`. It uses the operator mnemonic from the environment (`@ton/ton`, no
-Blueprint) and is covered by `tests/ServerMintExample.spec.ts`.
+the example keeps it in `pending-batch.json` and rewrites the requests file with what still has to be sent (so running it
+again with the same file does not mint anything twice). It uses the operator mnemonic from the environment (`@ton/ton`,
+no Blueprint) and is covered by `tests/ServerMintExample.spec.ts`.
 For a one-off mint: `WALLET_MNEMONIC=... WALLET_VERSION=v4 npx blueprint run mintViaMinter --mnemonic …`.
 Run one `mintPending` at a time and do not mint through the collection in other ways meanwhile: a batch is confirmed by
 `next_item_index` and the kinds of its first and last voucher.
@@ -164,7 +167,7 @@ Item index and kind are independent: item #57 may be a `1.json` voucher.
 
 ```bash
 npm install
-npm run build        # compile both contracts
+npm run build        # compile the contracts (collection, item, minter)
 npm test             # tests in @ton/sandbox
 
 npx blueprint run deployNftVoucherCollection --testnet
@@ -185,11 +188,13 @@ await collection.sendMint(sender, {
 });
 ```
 
-On mint the item receives `voucherValue + 0.05 TON` (storage reserve). Up to 249 vouchers can be minted in one message with `sendBatchMint`.
+On mint the item receives `voucherValue + 0.05 TON` (storage reserve). One `sendBatchMint` fits about 130 vouchers into
+the gas limit (the contract refuses 250+; a batch that runs out of gas bounces back with its TON).
 
 ## Notes
 
-- If you change `nft_voucher_item.fc`, update the pinned item code in `voucher-redeemer` as well, otherwise the redeemer will not recognise the new items.
+- If you change `nft_voucher_item.fc`, update the pinned item code in `voucher-redeemer` as well, otherwise the redeemer will not recognise the new items
+  (the pinned collection code there is used by its tests, update it too when the collection changes).
 - The collection owner is fully trusted: they mint vouchers and decide how much TON goes into each one.
 - Collection ownership can be transferred with `changeCollectionOwner` (op 3). It is one step and immediate, so the script
   asks for the new address twice and refuses obviously wrong ones. The redeemer recognises vouchers by the collection

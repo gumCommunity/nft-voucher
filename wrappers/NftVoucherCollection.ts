@@ -130,7 +130,7 @@ export class NftVoucherCollection implements Contract {
         });
     }
 
-    /** Mint up to 249 vouchers in one message. */
+    /** Batch mint: about 130 vouchers fit into one message (gas limit); the contract refuses 250+. */
     async sendBatchMint(provider: ContractProvider, via: Sender, items: MintParams[], opts?: { value?: bigint; queryId?: number }) {
         if (items.length >= 250) throw new Error('Too many items in one batch (max 249)');
         const dict = Dictionary.empty(Dictionary.Keys.BigUint(64), MintDictValue);
