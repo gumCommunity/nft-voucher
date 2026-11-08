@@ -70,18 +70,18 @@ export function nftVoucherCollectionConfigToCell(config: NftVoucherCollectionCon
         .endCell();
 }
 
-function buildItemInit(p: MintParams): Cell {
+export function buildItemInit(p: MintParams): Cell {
     return beginCell()
         .storeAddress(p.itemOwner)
         .storeRef(beginCell().storeStringTail(p.itemContent).endCell())
         .endCell();
 }
 
-function itemAmount(p: MintParams): bigint {
+export function itemAmount(p: MintParams): bigint {
     return p.voucherValue + (p.storageReserve ?? DEFAULT_ITEM_STORAGE_RESERVE);
 }
 
-const MintDictValue: DictionaryValue<MintParams> = {
+export const MintDictValue: DictionaryValue<MintParams> = {
     serialize(src, builder) {
         builder.storeCoins(itemAmount(src)).storeRef(buildItemInit(src));
     },

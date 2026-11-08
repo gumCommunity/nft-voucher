@@ -17,3 +17,7 @@ export const VOUCHER_KINDS = [
 ] as const;
 
 export type VoucherKind = (typeof VOUCHER_KINDS)[number];
+
+// Minter: max vouchers the operator (server) may mint per 24 hours.
+// null = deployMinter asks for it. Can be changed later with manageMinter.
+export const MINTER_LIMIT_PER_DAY: number | null = null;

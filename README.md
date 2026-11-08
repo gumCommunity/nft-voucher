@@ -13,6 +13,7 @@ Burn follows the `destroy` operation of SBT (TEP-85).
 |---|---|
 | `contracts/nft_voucher_collection.fc` | Getgems collection: mint (op 1), batch mint (op 2), change owner (op 3), change content/royalty (op 4, as in getgems `nft-collection-editable`, plus a royalty check) |
 | `contracts/nft_voucher_item.fc` | Voucher item, Getgems `nft-item-v2.fc` with the changes below |
+| `contracts/nft_voucher_minter.fc` | Minter: owns the collection, lets a server (operator) mint within a daily limit, everything else stays with the admin — see [Minter](#minter-server-minting-with-a-limited-key) |
 
 ### Differences from Getgems `nft-item-v2`
 
@@ -37,6 +38,64 @@ The burn does not use flag +32, so the account is not deleted: a burned voucher 
 | 333 | address is not in workchain 0 |
 | 410 | collection: invalid royalty (base is 0 or more than 100%) |
 | 0xffff | unknown op |
+
+## Minter: server minting with a limited key
+
+The collection owner can mint unlimited vouchers, i.e. effectively claim all GUM on the redeemer. To keep that power out of
+a server, the collection is owned by the **minter** contract, which has two roles:
+
+```
+admin (cold wallet) ──manages──> Minter ──owns──> Collection
+operator (server key) ──"mint a voucher" only──> Minter
+```
+
+| Operator (server) can | Admin can |
+|---|---|
+| mint vouchers through the minter (`minter_mint`, `minter_batch_mint`) | replace or disable the operator |
+| only allowed kinds (`0.json`, `1.json`, `2.json`) | pause minting |
+| at most **N vouchers per 24 h** | change the daily limit and allowed kinds |
+| paying the TON itself (the minter balance is never used) | change royalty / metadata, transfer the collection (to a new minter or a wallet) |
+| | withdraw TON; change admin in **two steps** (propose → the new admin accepts) |
+
+If the server key leaks: at most N vouchers per day can be minted until the admin replaces the operator (one transaction).
+The redeemer is not affected by any of this: it recognises vouchers by the collection address, not by its owner.
+
+| Op | Code | Who |
+|---|---|---|
+| `minter_mint` | `0x2eb92088` | operator: `query_id item_index:uint64 amount:Coins ^nft_content` (attach `amount + 0.03 TON`) |
+| `minter_batch_mint` | `0x76671074` | operator: `query_id ^deploy_list` (same dict as collection op 2, up to 249) |
+| `minter_set_operator` | `0x25745a78` | admin (`addr_none` disables) |
+| `minter_set_paused` | `0x5ce84131` | admin |
+| `minter_set_limit` | `0x1907b1ec` | admin, vouchers per 24 h |
+| `minter_set_kind` | `0x26796708` | admin: `content_hash:uint256 allowed:Bool` |
+| `minter_collection_call` | `0x75f071b1` | admin: any `^body` to the collection as its owner (op 3 change owner, op 4 royalty, …) |
+| `minter_withdraw_ton` | `0x1c88f70d` | admin (`0` = all except 0.05 TON) |
+| `minter_propose_admin` / `minter_accept_admin` | `0x3d8bf3c0` / `0x26728af0` | admin proposes, the new admin accepts |
+
+Errors: `401` not admin, `402` not operator, `403` paused, `404` kind not allowed, `405` daily limit reached,
+`406` not enough TON attached, `407` not the pending admin, `408` empty or too large batch.
+Get methods: `get_minter_data` (admin, pending admin, operator, collection, paused, limit, minted in the current window,
+window end), `is_kind_allowed(content_hash)`.
+
+The 24-hour window starts with the first mint after the previous window ended, so in the worst case 2 × N vouchers can be
+minted within a short time around the window boundary. If the collection rejects an operator mint, the counter is restored.
+
+**Setup**
+
+```bash
+npx blueprint run deployNftVoucherCollection --testnet           # owner = your (admin) wallet
+npx blueprint run deployMinter <collection> --testnet            # asks operator + limit, then hands the collection over
+npx blueprint run manageMinter <minter> --testnet                # admin panel
+npx blueprint run mintViaMinter <minter> --testnet               # mint as the operator
+```
+
+`MINTER_LIMIT_PER_DAY` in `scripts/voucherConfig.ts` sets the limit (if `null`, `deployMinter` asks).
+Once the minter owns the collection, `mintVoucher`, `changeRoyalty` and `changeCollectionOwner` point you to `manageMinter`.
+
+**Server.** [`examples/serverMint.ts`](examples/serverMint.ts) mints with the operator mnemonic from the environment
+(`@ton/ton`, no Blueprint). Alternatively `WALLET_MNEMONIC=... WALLET_VERSION=v4 npx blueprint run mintViaMinter --mnemonic …`.
+Mint one voucher at a time (or use batch mint): the item index is read from the collection, and two mints with the same
+index produce only one voucher.
 
 ## Metadata (Gumcoin Vouchers)
 

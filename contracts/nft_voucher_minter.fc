@@ -1,0 +1,318 @@
+#include "imports/stdlib.fc";
+#include "imports/params.fc";
+
+;;
+;;  NFT Voucher Minter
+;;
+;;  Owner of the voucher collection. Splits the collection owner's powers in two:
+;;
+;;    * operator (hot key, e.g. a server): can ONLY mint vouchers through the minter
+;;        - only allowed voucher kinds (item content cell hash in `kinds`)
+;;        - at most `limit` vouchers per 24-hour window
+;;        - pays the TON for the vouchers itself (the minter's balance is never used)
+;;    * admin (cold wallet): everything else
+;;        - replace / disable the operator, pause minting, change the limit and allowed kinds
+;;        - send any message to the collection as its owner (change owner -> move the collection
+;;          to a new minter or back to a wallet, change royalty / metadata, unlimited mint)
+;;        - withdraw TON from the minter
+;;        - two-step admin change (propose + accept by the new admin)
+;;
+;;  If the operator key leaks: at most `limit` vouchers per day can be minted until the admin
+;;  replaces the operator (or pauses the minter).
+;;
+
+;; ---------- op codes ----------
+int op::minter_mint() asm "0x2eb92088 PUSHINT";
+int op::minter_batch_mint() asm "0x76671074 PUSHINT";
+int op::minter_set_operator() asm "0x25745a78 PUSHINT";
+int op::minter_set_paused() asm "0x5ce84131 PUSHINT";
+int op::minter_set_limit() asm "0x1907b1ec PUSHINT";
+int op::minter_set_kind() asm "0x26796708 PUSHINT";
+int op::minter_collection_call() asm "0x75f071b1 PUSHINT";
+int op::minter_withdraw_ton() asm "0x1c88f70d PUSHINT";
+int op::minter_propose_admin() asm "0x3d8bf3c0 PUSHINT";
+int op::minter_accept_admin() asm "0x26728af0 PUSHINT";
+
+int op::collection_mint() asm "1 PUSHINT";
+int op::collection_batch_mint() asm "2 PUSHINT";
+int op::excesses() asm "0xd53276db PUSHINT";
+
+;; ---------- errors ----------
+int error::not_admin() asm "401 PUSHINT";
+int error::not_operator() asm "402 PUSHINT";
+int error::paused() asm "403 PUSHINT";
+int error::kind_not_allowed() asm "404 PUSHINT";
+int error::limit_exceeded() asm "405 PUSHINT";
+int error::not_enough_ton() asm "406 PUSHINT";
+int error::not_pending_admin() asm "407 PUSHINT";
+int error::bad_batch() asm "408 PUSHINT";
+int error::unknown_op() asm "0xffff PUSHINT";
+
+;; ---------- constants ----------
+int period() asm "86400 PUSHINT";                ;; 24 hours
+int mint_fee_per_item() asm "30000000 PUSHINT";  ;; 0.03 TON per voucher on top of its amount (collection gas + deploy fees)
+int min_storage() asm "50000000 PUSHINT";        ;; 0.05 TON kept on withdraw_ton
+
+;; ---------- storage ----------
+;; admin:MsgAddress operator:MsgAddress paused:Bool limit:uint32 period_start:uint32 minted:uint32
+;; ^[ collection:MsgAddress pending_admin:MsgAddress kinds:(HashmapE 256 Cell) ]
+
+global slice storage::admin;
+global slice storage::operator;          ;; addr_none = minting by operator disabled
+global int   storage::paused;
+global int   storage::limit;             ;; vouchers per period
+global int   storage::period_start;
+global int   storage::minted;            ;; vouchers minted by the operator in the current period
+global slice storage::collection;
+global slice storage::pending_admin;     ;; addr_none when no admin change is pending
+global cell  storage::kinds;             ;; cell_hash(item content) -> empty
+
+() load_data() impure inline {
+    slice ds = get_data().begin_parse();
+    storage::admin = ds~load_msg_addr();
+    storage::operator = ds~load_msg_addr();
+    storage::paused = ds~load_int(1);
+    storage::limit = ds~load_uint(32);
+    storage::period_start = ds~load_uint(32);
+    storage::minted = ds~load_uint(32);
+    slice r = ds~load_ref().begin_parse();
+    storage::collection = r~load_msg_addr();
+    storage::pending_admin = r~load_msg_addr();
+    storage::kinds = r~load_dict();
+}
+
+() save_data() impure inline {
+    set_data(begin_cell()
+        .store_slice(storage::admin)
+        .store_slice(storage::operator)
+        .store_int(storage::paused, 1)
+        .store_uint(storage::limit, 32)
+        .store_uint(storage::period_start, 32)
+        .store_uint(storage::minted, 32)
+        .store_ref(begin_cell()
+            .store_slice(storage::collection)
+            .store_slice(storage::pending_admin)
+            .store_dict(storage::kinds)
+            .end_cell())
+        .end_cell());
+}
+
+;; ---------- helpers ----------
+
+int is_addr_none(slice addr) inline {
+    return addr.preload_uint(2) == 0;
+}
+
+() roll_period() impure inline {
+    if (now() >= storage::period_start + period()) {
+        storage::period_start = now();
+        storage::minted = 0;
+    }
+}
+
+int kind_allowed?(cell content) inline {
+    (_, int found?) = storage::kinds.udict_get?(256, cell_hash(content));
+    return found?;
+}
+
+;; nft_content is what the collection passes to the new item: owner:MsgAddress ^content [forward fields]
+() check_item(cell nft_content) impure inline {
+    slice s = nft_content.begin_parse();
+    force_chain(s~load_msg_addr());
+    throw_unless(error::kind_not_allowed(), kind_allowed?(s~load_ref()));
+}
+
+() send_body_ref(slice to, int value, cell body, int mode, int bounce?) impure inline {
+    send_raw_message(begin_cell()
+        .store_uint(bounce? ? 0x18 : 0x10, 6)
+        .store_slice(to)
+        .store_coins(value)
+        .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1) ;; body in ref
+        .store_ref(body)
+        .end_cell(), mode);
+}
+
+;; Operator mints are bounceable and carry the number of vouchers in query_id,
+;; so if the collection rejects them the counter is restored.
+() count_mint(int count) impure inline {
+    roll_period();
+    throw_unless(error::limit_exceeded(), storage::minted + count <= storage::limit);
+    storage::minted += count;
+    save_data();
+}
+
+;; ---------- entry point ----------
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    slice sender = cs~load_msg_addr();
+
+    load_data();
+
+    if (flags & 1) { ;; bounced
+        in_msg_body~skip_bits(32); ;; 0xffffffff
+        int op = in_msg_body~load_uint(32);
+        if (((op == op::collection_mint()) | (op == op::collection_batch_mint())) & equal_slices(sender, storage::collection)) {
+            storage::minted = max(0, storage::minted - in_msg_body~load_uint(64));
+            save_data();
+        }
+        return ();
+    }
+
+    if (in_msg_body.slice_empty?()) { ;; plain TON top-up
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+
+    if (op == op::excesses()) {
+        return ();
+    }
+
+    ;; ---------- operator ----------
+    if (op == op::minter_mint()) {
+        throw_unless(error::not_operator(), equal_slices(sender, storage::operator) & (~ is_addr_none(storage::operator)));
+        throw_if(error::paused(), storage::paused);
+        int item_index = in_msg_body~load_uint(64);
+        int amount = in_msg_body~load_coins();
+        cell nft_content = in_msg_body~load_ref();
+        check_item(nft_content);
+        throw_unless(error::not_enough_ton(), msg_value >= amount + mint_fee_per_item());
+        count_mint(1);
+        send_body_ref(storage::collection, 0, begin_cell()
+            .store_uint(op::collection_mint(), 32)
+            .store_uint(1, 64) ;; query_id = number of vouchers (for bounce)
+            .store_uint(item_index, 64)
+            .store_coins(amount)
+            .store_ref(nft_content)
+            .end_cell(), 64, -1);
+        return ();
+    }
+    if (op == op::minter_batch_mint()) {
+        throw_unless(error::not_operator(), equal_slices(sender, storage::operator) & (~ is_addr_none(storage::operator)));
+        throw_if(error::paused(), storage::paused);
+        cell deploy_list = in_msg_body~load_ref();
+        cell list = deploy_list;
+        int count = 0;
+        int total = 0;
+        do {
+            var (_, item, f?) = list~udict::delete_get_min(64);
+            if (f?) {
+                count += 1;
+                total += item~load_coins();
+                check_item(item~load_ref());
+            }
+        } until (~ f?);
+        throw_unless(error::bad_batch(), (count > 0) & (count < 250));
+        throw_unless(error::not_enough_ton(), msg_value >= total + count * mint_fee_per_item());
+        count_mint(count);
+        send_body_ref(storage::collection, 0, begin_cell()
+            .store_uint(op::collection_batch_mint(), 32)
+            .store_uint(count, 64) ;; query_id = number of vouchers (for bounce)
+            .store_ref(deploy_list)
+            .end_cell(), 64, -1);
+        return ();
+    }
+
+    ;; ---------- admin change, step 2 ----------
+    if (op == op::minter_accept_admin()) {
+        throw_unless(error::not_pending_admin(), (~ is_addr_none(storage::pending_admin)) & equal_slices(sender, storage::pending_admin));
+        storage::admin = storage::pending_admin;
+        storage::pending_admin = null_addr();
+        save_data();
+        return ();
+    }
+
+    ;; ---------- admin ----------
+    throw_unless(error::not_admin(), equal_slices(sender, storage::admin));
+
+    if (op == op::minter_set_operator()) {
+        slice new_operator = in_msg_body~load_msg_addr(); ;; addr_none disables the operator
+        if (~ is_addr_none(new_operator)) {
+            force_chain(new_operator);
+        }
+        storage::operator = new_operator;
+        save_data();
+        return ();
+    }
+    if (op == op::minter_set_paused()) {
+        storage::paused = in_msg_body~load_int(1);
+        save_data();
+        return ();
+    }
+    if (op == op::minter_set_limit()) {
+        storage::limit = in_msg_body~load_uint(32);
+        save_data();
+        return ();
+    }
+    if (op == op::minter_set_kind()) {
+        int content_hash = in_msg_body~load_uint(256);
+        int allowed? = in_msg_body~load_int(1);
+        if (allowed?) {
+            storage::kinds~udict_set(256, content_hash, begin_cell().end_cell().begin_parse());
+        } else {
+            storage::kinds~udict_delete?(256, content_hash);
+        }
+        save_data();
+        return ();
+    }
+    if (op == op::minter_collection_call()) {
+        ;; any message to the collection on behalf of its owner (op 3 change owner, op 4 royalty/content, op 1/2 mint)
+        ;; non-bounceable, so a failing call can never touch the operator's counter
+        send_body_ref(storage::collection, 0, in_msg_body~load_ref(), 64, 0);
+        return ();
+    }
+    if (op == op::minter_withdraw_ton()) {
+        int amount = in_msg_body~load_coins(); ;; 0 = everything except min_storage
+        if (amount == 0) {
+            raw_reserve(min_storage(), 0);
+            send_raw_message(begin_cell()
+                .store_uint(0x10, 6).store_slice(storage::admin).store_coins(0)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                .store_uint(op::excesses(), 32).store_uint(query_id, 64)
+                .end_cell(), 128);
+        } else {
+            throw_unless(error::not_enough_ton(), my_balance - msg_value - amount >= min_storage());
+            send_raw_message(begin_cell()
+                .store_uint(0x10, 6).store_slice(storage::admin).store_coins(amount)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+                .store_uint(op::excesses(), 32).store_uint(query_id, 64)
+                .end_cell(), 1);
+        }
+        return ();
+    }
+    if (op == op::minter_propose_admin()) {
+        slice new_admin = in_msg_body~load_msg_addr(); ;; addr_none cancels a pending change
+        if (~ is_addr_none(new_admin)) {
+            force_chain(new_admin);
+        }
+        storage::pending_admin = new_admin;
+        save_data();
+        return ();
+    }
+
+    throw(error::unknown_op());
+}
+
+;; ---------- get methods ----------
+
+;; (admin, pending_admin, operator, collection, paused, limit, minted_in_current_period, period_ends_at)
+(slice, slice, slice, slice, int, int, int, int) get_minter_data() method_id {
+    load_data();
+    int minted = storage::minted;
+    int ends = storage::period_start + period();
+    if (now() >= ends) { ;; the window has already rolled over
+        minted = 0;
+        ends = now() + period();
+    }
+    return (storage::admin, storage::pending_admin, storage::operator, storage::collection,
+            storage::paused, storage::limit, minted, ends);
+}
+
+int is_kind_allowed(int content_hash) method_id {
+    load_data();
+    (_, int found?) = storage::kinds.udict_get?(256, content_hash);
+    return found?;
+}

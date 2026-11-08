@@ -2,12 +2,17 @@ import { Address, toNano } from '@ton/core';
 import { NetworkProvider } from '@ton/blueprint';
 import { NftVoucherCollection } from '../wrappers/NftVoucherCollection';
 import { COMMON_CONTENT_URL, VOUCHER_KINDS } from './voucherConfig';
+import { notOwnerMessage } from './ownerHint';
 
 export async function run(provider: NetworkProvider, args: string[]) {
     const ui = provider.ui();
 
     const collectionAddress = Address.parse(args[0] ?? (await ui.input('Collection address')));
     const collection = provider.open(NftVoucherCollection.createFromAddress(collectionAddress));
+    const { ownerAddress } = await collection.getCollectionData();
+    if (!ownerAddress.equals(provider.sender().address!)) {
+        throw new Error(await notOwnerMessage(provider, ownerAddress, provider.sender().address!));
+    }
 
     const kind = await ui.choose('Voucher kind:', [...VOUCHER_KINDS], (k) => `${k.name} (${k.content})`);
     const owner = await ui.inputAddress('Voucher owner address');

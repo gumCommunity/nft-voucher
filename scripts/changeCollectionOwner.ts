@@ -1,6 +1,7 @@
 import { Address } from '@ton/core';
 import { NetworkProvider } from '@ton/blueprint';
 import { NftVoucherCollection } from '../wrappers/NftVoucherCollection';
+import { notOwnerMessage } from './ownerHint';
 
 // Transfers the collection ownership (the right to mint vouchers) to another address.
 // One step, effective immediately: a wrong address means minting is lost forever.
@@ -20,7 +21,7 @@ export async function run(provider: NetworkProvider, args: string[]) {
     ui.write(`Current owner:  ${data.ownerAddress.toString()}`);
     ui.write(`Minted items:   ${data.nextItemIndex}`);
     if (!data.ownerAddress.equals(me)) {
-        throw new Error(`Your wallet ${me.toString()} is not the collection owner, the transaction would fail.`);
+        throw new Error(await notOwnerMessage(provider, data.ownerAddress, me));
     }
 
     ui.write('⚠ The new owner gets the right to mint vouchers (and therefore to claim GUM from the redeemer).');

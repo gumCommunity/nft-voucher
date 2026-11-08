@@ -1,6 +1,7 @@
 import { Address } from '@ton/core';
 import { NetworkProvider } from '@ton/blueprint';
 import { NftVoucherCollection } from '../wrappers/NftVoucherCollection';
+import { notOwnerMessage } from './ownerHint';
 
 const pct = (f: number, b: number) => `${(f * 100) / b}%`;
 
@@ -31,7 +32,7 @@ export async function run(provider: NetworkProvider, args: string[]) {
     ui.write(`Owner:            ${data.ownerAddress.toString()}`);
     ui.write(`Current royalty:  ${pct(royalty.royaltyFactor, royalty.royaltyBase)} to ${royalty.royaltyAddress.toString()}`);
     if (!data.ownerAddress.equals(me)) {
-        throw new Error(`Your wallet ${me.toString()} is not the collection owner, the transaction would fail.`);
+        throw new Error(await notOwnerMessage(provider, data.ownerAddress, me));
     }
 
     let next: { factor: number; base: number } | null = null;
