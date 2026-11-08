@@ -6,19 +6,22 @@ import { MINTER_LIMIT_PER_DAY, VOUCHER_KINDS } from './voucherConfig';
 
 // Deploys a minter for the collection and (optionally) hands the collection over to it.
 // The connected wallet becomes the minter admin.
+// Non-interactive: npx blueprint run deployMinter --testnet --tonconnect <collection> <operator> <limit_per_day> yes
 export async function run(provider: NetworkProvider, args: string[]) {
     const ui = provider.ui();
     const admin = provider.sender().address!;
+    const autoYes = args[3] === 'yes';
+    const confirm = async (q: string) => (autoYes ? (ui.write(`${q} yes`), true) : ui.prompt(q));
 
     const collectionAddress = args[0] ? Address.parse(args[0]) : await ui.inputAddress('Collection address');
     const collection = provider.open(NftVoucherCollection.createFromAddress(collectionAddress));
     const { ownerAddress } = await collection.getCollectionData();
 
-    const operator = await ui.inputAddress('Operator address (the server wallet that will mint vouchers)');
-    if (operator.equals(admin) && !(await ui.prompt('Operator = admin (your wallet). The point of the minter is a separate server key. Continue?'))) {
+    const operator = args[1] ? Address.parse(args[1]) : await ui.inputAddress('Operator address (the server wallet that will mint vouchers)');
+    if (operator.equals(admin) && !(await confirm('Operator = admin (your wallet). The point of the minter is a separate server key. Continue?'))) {
         return;
     }
-    let limit = MINTER_LIMIT_PER_DAY;
+    let limit = args[2] !== undefined ? Number(args[2]) : MINTER_LIMIT_PER_DAY;
     while (limit === null || !Number.isInteger(limit) || limit < 0) {
         limit = Number((await ui.input('Max vouchers the operator may mint per 24 hours')).trim());
     }
@@ -28,7 +31,7 @@ export async function run(provider: NetworkProvider, args: string[]) {
     ui.write(`Operator:  ${operator.toString()}`);
     ui.write(`Limit:     ${limit} vouchers / 24h`);
     ui.write(`Kinds:     ${kinds.join(', ')}`);
-    if (!(await ui.prompt('Deploy the minter?'))) return;
+    if (!(await confirm('Deploy the minter?'))) return;
 
     const minter = provider.open(
         NftVoucherMinter.createFromConfig({ admin, operator, collection: collectionAddress, limitPerDay: limit, kinds }, await compile('NftVoucherMinter')),
@@ -41,7 +44,7 @@ export async function run(provider: NetworkProvider, args: string[]) {
         ui.write(`The collection is owned by ${ownerAddress.toString()}, not by your wallet: transfer it to the minter from that owner.`);
         return;
     }
-    if (!(await ui.prompt(`Transfer the collection ${collectionAddress.toString()} to the minter now?`))) {
+    if (!(await confirm(`Transfer the collection ${collectionAddress.toString()} to the minter now?`))) {
         ui.write(`Later: npx blueprint run changeCollectionOwner ${collectionAddress.toString()}  (new owner = ${minter.address.toString()})`);
         return;
     }
