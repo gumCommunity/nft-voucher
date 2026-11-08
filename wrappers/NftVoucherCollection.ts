@@ -44,6 +44,7 @@ export const Opcodes = {
 
 export const CollectionErrors = {
     notOwner: 401,
+    badIndex: 402, // mint: item_index is not next_item_index (batch mint: 403 + position in the batch)
     invalidRoyalty: 410,
 };
 

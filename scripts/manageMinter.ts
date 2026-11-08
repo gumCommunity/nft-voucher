@@ -114,8 +114,8 @@ export async function run(provider: NetworkProvider, args: string[]) {
             break;
         }
         case 'set collection fees': {
-            ui.write('TON the minter forwards to the collection on top of voucher amounts. Too low = the collection pays');
-            ui.write('the difference from its own balance (and minting fails when it runs out); too high = the surplus stays on the collection.');
+            ui.write('TON the minter forwards to the collection on top of voucher amounts. Too low = the collection pays the difference');
+            ui.write('from its own balance; when that runs out, mints bounce (TON back to the operator); too high = the surplus stays on the collection.');
             const item = toNano((await ui.input(`Per voucher, TON (now ${fromNano(d.feePerItem)})`)).trim() || fromNano(d.feePerItem));
             const call = toNano((await ui.input(`Per message, TON (now ${fromNano(d.feePerCall)})`)).trim() || fromNano(d.feePerCall));
             if (!(await ui.prompt(`Set fees to ${fromNano(item)} per voucher + ${fromNano(call)} per message?`))) return;

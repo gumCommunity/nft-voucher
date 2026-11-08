@@ -10,8 +10,12 @@
 ;;        - only allowed voucher kinds (item content cell hash in `kinds`)
 ;;        - at most `limit` vouchers per 24-hour window
 ;;        - pays the TON for the vouchers itself (the minter's balance is never used);
-;;          only what the collection needs is forwarded, the rest is refunded to the operator
+;;          only what the collection needs is forwarded, the rest is refunded to the operator;
+;;          if the minter or the collection cannot pay for the mint, the TON comes back (mode +16 / bounce)
+;;          and the daily counter is restored
 ;;        - batches of up to 100 vouchers (collection gas limit)
+;;        - nft_content must be exactly owner + ^content: no forward_amount, so a fresh voucher
+;;          cannot notify a contract (e.g. the redeemer) on mint
 ;;    * admin (cold wallet): everything else
 ;;        - replace / disable the operator, pause minting, change the limit and allowed kinds
 ;;        - send any message to the collection as its owner (change owner -> move the collection
@@ -49,12 +53,16 @@ int error::limit_exceeded() asm "405 PUSHINT";
 int error::not_enough_ton() asm "406 PUSHINT";
 int error::not_pending_admin() asm "407 PUSHINT";
 int error::bad_batch() asm "408 PUSHINT";
+int error::bad_item() asm "409 PUSHINT";
 int error::unknown_op() asm "0xffff PUSHINT";
 
 ;; ---------- constants ----------
 int period() asm "86400 PUSHINT";                ;; 24 hours
 int max_batch() asm "100 PUSHINT";               ;; collection gas limit allows ~140 deploys per message
-int minter_fee() asm "10000000 PUSHINT";         ;; 0.01 TON for the minter's own gas and the refund message
+;; Minimum the operator leaves for the minter's own gas and messages (the unused part is refunded).
+;; Measured with 2026 prices: ~0.0008 TON for 1 voucher, ~0.024 TON for 100 (dict walk grows with the batch).
+int minter_fee_base() asm "10000000 PUSHINT";    ;; 0.01 TON
+int minter_fee_per_item() asm "1000000 PUSHINT"; ;; + 0.001 TON per voucher
 int min_storage() asm "50000000 PUSHINT";        ;; 0.05 TON kept on withdraw_ton
 
 ;; ---------- storage ----------
@@ -125,11 +133,14 @@ int kind_allowed?(cell content) inline {
     return found?;
 }
 
-;; nft_content is what the collection passes to the new item: owner:MsgAddress ^content [forward fields]
+;; nft_content is what the collection passes to the new item: owner:MsgAddress ^content [forward fields].
+;; The operator may only send owner + content: with forward fields the new item would send
+;; ownership_assigned (prev_owner = collection) to its owner, e.g. make the redeemer pay GUM to the collection.
 () check_item(cell nft_content) impure inline {
     slice s = nft_content.begin_parse();
     force_chain(s~load_msg_addr());
     throw_unless(error::kind_not_allowed(), kind_allowed?(s~load_ref()));
+    throw_unless(error::bad_item(), s.slice_empty?());
 }
 
 () send_body_ref(slice to, int value, cell body, int mode, int bounce?) impure inline {
@@ -164,10 +175,12 @@ int kind_allowed?(cell content) inline {
 ;; Forwards an operator mint to the collection with exactly amount + fees, refunds the rest.
 () forward_mint(int my_balance, int msg_value, int count, int total_amount, cell body, int query_id) impure inline {
     int to_collection = total_amount + count * storage::fee_per_item + storage::fee_per_call;
-    throw_unless(error::not_enough_ton(), msg_value >= to_collection + minter_fee());
+    throw_unless(error::not_enough_ton(), msg_value >= to_collection + minter_fee_base() + count * minter_fee_per_item());
     count_mint(count);
     raw_reserve(my_balance - msg_value, 0); ;; the minter's own balance is never spent
-    send_body_ref(storage::collection, to_collection, body, 1, -1);
+    ;; +16: if the attached TON still cannot pay for this message, the operator's message bounces
+    ;; (state, incl. the counter, is rolled back); without it the TON would stay on the minter
+    send_body_ref(storage::collection, to_collection, body, 1 + 16, -1);
     refund_rest(storage::operator, query_id);
 }
 

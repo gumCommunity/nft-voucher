@@ -4,6 +4,12 @@
 
 ;; Based on getgems-io/nft-contracts nft-collection.fc (MIT) + op 4 (change content/royalty) from nft-collection-editable.fc.
 ;; NFT collection smart contract
+;;
+;; Differences from getgems (the collection has no TON withdrawal, so nothing must get stuck here):
+;;   * item indexes are strictly sequential (op 1 and op 2 accept only next_item_index): a re-used index
+;;     fails here and the request bounces, instead of bouncing at the existing item and leaving its TON here;
+;;   * deploy messages use mode 1 + 16: if the collection cannot pay for them (action phase fails),
+;;     the whole request bounces back to the sender instead of keeping its TON.
 
 ;; storage scheme
 ;; default#_ royalty_factor:uint16 royalty_base:uint16 royalty_address:MsgAddress = RoyaltyParams;
@@ -57,7 +63,9 @@ slice calculate_nft_item_address(int wc, cell state_init) {
             .store_uint(4 + 2 + 1, 1 + 4 + 4 + 64 + 32 + 1 + 1 + 1)
             .store_ref(state_init)
             .store_ref(nft_content);
-  send_raw_message(msg.end_cell(), 1); ;; pay transfer fees separately, revert on errors
+  ;; +1: pay transfer fees separately
+  ;; +16: if this cannot be paid, bounce the request (without +16 a failed action phase keeps the TON here)
+  send_raw_message(msg.end_cell(), 1 + 16);
 }
 
 () send_royalty_params(slice to_address, int query_id, slice data) impure inline {
@@ -99,13 +107,9 @@ slice calculate_nft_item_address(int wc, cell state_init) {
 
     if (op == 1) { ;; deploy new nft
       int item_index = in_msg_body~load_uint(64);
-      throw_unless(402, item_index <= next_item_index);
-      var is_last = item_index == next_item_index;
+      throw_unless(402, item_index == next_item_index); ;; strictly sequential, see the header
       deploy_nft_item(item_index, nft_item_code, in_msg_body~load_coins(), in_msg_body~load_ref());
-      if (is_last) {
-        next_item_index += 1;
-        save_data(owner_address, next_item_index, content, nft_item_code, royalty_params);
-      }
+      save_data(owner_address, next_item_index + 1, content, nft_item_code, royalty_params);
       return ();
     }
     if (op == 2) { ;; batch deploy of new nfts
@@ -119,11 +123,9 @@ slice calculate_nft_item_address(int wc, cell state_init) {
             throw(399);
           }
 
-          throw_unless(403 + counter, item_index <= next_item_index);
+          throw_unless(403 + counter, item_index == next_item_index); ;; consecutive from next_item_index
           deploy_nft_item(item_index, nft_item_code, item~load_coins(), item~load_ref());
-          if (item_index == next_item_index) {
-            next_item_index += 1;
-          }
+          next_item_index += 1;
         }
       } until ( ~ f?);
       save_data(owner_address, next_item_index, content, nft_item_code, royalty_params);
@@ -137,7 +139,7 @@ slice calculate_nft_item_address(int wc, cell state_init) {
     if (op == 4) { ;; change content and royalty (same message as getgems nft-collection-editable)
       cell new_content = in_msg_body~load_ref();
       cell new_royalty = in_msg_body~load_ref();
-      ;; royalty sanity check: base > 0 and factor <= base (at most 100%), address is std
+      ;; royalty sanity check: base > 0 and factor <= base (at most 100%), the address must parse
       slice rs = new_royalty.begin_parse();
       int factor = rs~load_uint(16);
       int base = rs~load_uint(16);

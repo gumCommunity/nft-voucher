@@ -11,7 +11,7 @@ Burn follows the `destroy` operation of SBT (TEP-85).
 
 | File | Description |
 |---|---|
-| `contracts/nft_voucher_collection.fc` | Getgems collection: mint (op 1), batch mint (op 2), change owner (op 3), change content/royalty (op 4, as in getgems `nft-collection-editable`, plus a royalty check) |
+| `contracts/nft_voucher_collection.fc` | Getgems collection: mint (op 1), batch mint (op 2), change owner (op 3), change content/royalty (op 4, as in getgems `nft-collection-editable`, plus a royalty check); strictly sequential indexes and bouncing deploys, see below |
 | `contracts/nft_voucher_item.fc` | Voucher item, Getgems `nft-item-v2.fc` with the changes below |
 | `contracts/nft_voucher_minter.fc` | Minter: owns the collection, lets a server (operator) mint within a daily limit, everything else stays with the admin — see [Minter](#minter-server-minting-with-a-limited-key) |
 
@@ -28,12 +28,25 @@ Burn follows the `destroy` operation of SBT (TEP-85).
 
 The burn does not use flag +32, so the account is not deleted: a burned voucher is visible via `get_nft_data` (owner = `addr_none`), and the collection owner cannot mint the same index again (covered by tests).
 
+### Differences from Getgems `nft-collection`
+
+The collection has no TON withdrawal, so no TON may get stuck on it:
+
+1. **Strictly sequential indexes.** Mint (op 1) and batch mint (op 2) accept only `next_item_index` (a batch must continue
+   from it without gaps). In Getgems any index `<= next_item_index` is accepted; minting an index that already exists then
+   bounces at the existing item and its TON stays on the collection. Here such a mint fails in the collection and bounces
+   back to the sender.
+2. **Deploy messages use mode `1 + 16`.** If the collection cannot pay for the deploys (network fees above the forwarded
+   fees and its own balance), the whole request bounces back to the sender. Without `+16` a failed action phase is
+   rolled back but the TON stays on the contract.
+
 ### Errors
 
 | Code | Meaning |
 |---|---|
 | 401 | sender is not the owner (item: also when the voucher is already burned) |
-| 402 | not enough TON attached to `transfer` |
+| 402 | item: not enough TON attached to `transfer`; collection: `item_index` is not `next_item_index` |
+| 403 + n | collection batch mint: the n-th item index (from 1) is not the next one |
 | 405 | initialization not from the collection |
 | 333 | address is not in workchain 0 |
 | 410 | collection: invalid royalty (base is 0 or more than 100%) |
@@ -52,7 +65,7 @@ operator (server key) ──"mint a voucher" only──> Minter
 | Operator (server) can | Admin can |
 |---|---|
 | mint vouchers through the minter (`minter_mint`, `minter_batch_mint`) | replace or disable the operator |
-| only allowed kinds (`0.json`, `1.json`, `2.json`) | pause minting |
+| only allowed kinds (`0.json`, `1.json`, `2.json`), `nft_content` = owner + content only | pause minting |
 | at most **N vouchers per 24 h** | change the daily limit and allowed kinds |
 | paying the TON itself (the minter balance is never used; the surplus is refunded) | change royalty / metadata, transfer the collection (to a new minter or a wallet) |
 | | withdraw TON; change admin in **two steps** (propose → the new admin accepts) |
@@ -74,16 +87,24 @@ The redeemer is not affected by any of this: it recognises vouchers by the colle
 | `minter_propose_admin` / `minter_accept_admin` | `0x3d8bf3c0` / `0x26728af0` | admin proposes, the new admin accepts |
 
 Errors: `401` not admin, `402` not operator, `403` paused, `404` kind not allowed, `405` daily limit reached,
-`406` not enough TON attached, `407` not the pending admin, `408` empty batch or more than 100 vouchers.
+`406` not enough TON attached, `407` not the pending admin, `408` empty batch or more than 100 vouchers,
+`409` `nft_content` has extra fields (a `forward_amount` on mint would let a fresh voucher notify a contract, e.g. make
+the redeemer pay GUM to the collection).
 Get methods: `get_minter_data` (admin, pending admin, operator, collection, paused, limit, minted in the current window,
 window end, fee per voucher, fee per message), `is_kind_allowed(content_hash)`.
 
-**TON and fees.** The operator attaches at least `sum(amounts) + count × fee_per_item + fee_per_call + 0.01 TON`
-(`requiredMintValue` in the wrapper). The minter forwards `sum(amounts) + count × fee_per_item + fee_per_call` to the
-collection and refunds everything else to the operator. Defaults: 0.002 TON per voucher + 0.005 TON per message
-(about 2× what the collection really spends; the small surplus stays on the collection, which has no withdraw).
-If the collection rejects a mint, the TON comes back to the operator. If network fees ever rise above the configured
-fees, the collection pays the difference from its own balance until it runs out, so raise them with `manageMinter`.
+**TON and fees.** The operator attaches at least
+`sum(amounts) + count × (fee_per_item + 0.001 TON) + fee_per_call + 0.01 TON` (`requiredMintValue` in the wrapper; the
+`0.01 + count × 0.001` part is for the minter's own gas, ~0.024 TON for 100 vouchers). The minter forwards
+`sum(amounts) + count × fee_per_item + fee_per_call` to the collection and refunds everything else to the operator.
+Defaults: 0.002 TON per voucher + 0.005 TON per message (about 2× what the collection really spends; the small surplus
+stays on the collection, which has no withdraw).
+If the collection rejects a mint, the TON comes back to the operator and the daily counter is restored. That includes a
+mint nobody can pay for: if network fees rise above the configured fees, the collection pays the difference from its own
+balance, and when that is not enough the mint bounces (mode `+16`) instead of leaving the TON on the collection; if the
+minter's own share is not enough, the operator's message bounces. Raise the fees with `manageMinter` when that happens.
+Admin messages through `minter_collection_call` are sent non-bounceable (so they can never change the operator's counter):
+if an admin mint fails there, its TON stays on the collection, so attach enough.
 
 Measured in the sandbox, without the TON put inside the vouchers:
 
@@ -110,12 +131,18 @@ npx blueprint run mintViaMinter <minter> --testnet               # mint as the o
 Once the minter owns the collection, `mintVoucher`, `changeRoyalty` and `changeCollectionOwner` point you to `manageMinter`.
 
 **Server.** [`examples/serverMint.ts`](examples/serverMint.ts) has `mintPending(requests)`: collect requests (e.g. once a
-minute) and call it — it sends them in batches of up to 100 in one transaction each, waits for the collection, respects
-the daily limit and pause, and returns the requests that did not fit for the next run. It uses the operator mnemonic from
-the environment (`@ton/ton`, no Blueprint) and is covered by `tests/ServerMintExample.spec.ts`.
+minute) and call it — it sends them in batches of up to 100 in one transaction each, waits for the collection and respects
+the daily limit and pause. It returns `minted`, `deferred` (not sent: pass them again next time) and `pending`: a batch
+that was sent but not confirmed in time. **Never put the requests of a pending batch back into the queue** — pass it back
+as `opts.pending`: `mintPending` checks whether it landed and otherwise sends exactly the same batch (same item indexes)
+again; the collection accepts only `next_item_index`, so at most one copy is minted and the other one is refunded.
+Re-queueing those requests would mint them a second time if the first batch lands late. Save every batch in
+`opts.beforeSend` (it is called right before sending) so that a crash after sending does not lose it either; the CLI in
+the example keeps it in `pending-batch.json`. It uses the operator mnemonic from the environment (`@ton/ton`, no
+Blueprint) and is covered by `tests/ServerMintExample.spec.ts`.
 For a one-off mint: `WALLET_MNEMONIC=... WALLET_VERSION=v4 npx blueprint run mintViaMinter --mnemonic …`.
-Run one `mintPending` at a time: item indexes are read from the collection, and two concurrent mints with the same index
-produce only one voucher.
+Run one `mintPending` at a time and do not mint through the collection in other ways meanwhile: a batch is confirmed by
+`next_item_index` and the kinds of its first and last voucher.
 
 ## Metadata (Gumcoin Vouchers)
 

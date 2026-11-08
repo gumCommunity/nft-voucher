@@ -1,10 +1,11 @@
 import { Blockchain, SandboxContract, TreasuryContract } from '@ton/sandbox';
-import { Address, beginCell, Cell, toNano } from '@ton/core';
+import { Address, beginCell, Cell, Dictionary, DictionaryValue, toNano } from '@ton/core';
 import { compile } from '@ton/blueprint';
 import '@ton/test-utils';
-import { NftVoucherCollection } from '../wrappers/NftVoucherCollection';
+import { itemAmount, NftVoucherCollection } from '../wrappers/NftVoucherCollection';
 import { NftVoucherItem } from '../wrappers/NftVoucherItem';
-import { MAX_BATCH, MinterErrors, NftVoucherMinter, requiredMintValue } from '../wrappers/NftVoucherMinter';
+import { kindContentCell, MAX_BATCH, MinterErrors, MinterOpcodes, NftVoucherMinter, requiredMintValue } from '../wrappers/NftVoucherMinter';
+import { scaleFees } from './helpers/fees';
 
 const KINDS = ['0.json', '1.json', '2.json'];
 
@@ -331,6 +332,89 @@ describe('NftVoucherMinter', () => {
         await v.sendTransfer(alice.getSender(), { newOwner: bob.address, responseDestination: alice.address });
         await v.sendDestroy(bob.getSender());
         expect(await v.getIsBurned()).toBe(true);
+    });
+
+    const batchOf = (n: number, start = 0) =>
+        Array.from({ length: n }, (_, i) => ({ itemIndex: start + i, itemOwner: alice.address, itemContent: KINDS[i % 3], voucherValue: toNano('0.1') }));
+    const tonOf = async (a: Address) => (await blockchain.getContract(a)).balance;
+
+    it('requiredMintValue is enough for a full batch', async () => {
+        await minter.sendSetLimit(admin.getSender(), 1000);
+        const items = batchOf(MAX_BATCH);
+        const total = items.reduce((a, i) => a + itemAmount(i), 0n);
+        const res = await minter.sendBatchMint(operator.getSender(), items, { value: requiredMintValue(total, MAX_BATCH) });
+        expect(res.transactions).not.toHaveTransaction({ success: false });
+        expect((await collection.getCollectionData()).nextItemIndex).toBe(BigInt(MAX_BATCH));
+    });
+
+    it('if the minter cannot pay for its message (fee spike), the operator gets the TON back', async () => {
+        await minter.sendSetLimit(admin.getSender(), 1000);
+        const items = batchOf(MAX_BATCH);
+        const total = items.reduce((a, i) => a + itemAmount(i), 0n);
+        scaleFees(blockchain, 10n); // the minter's fee no longer covers its own gas
+        const operatorBefore = await tonOf(operator.address);
+        const minterBefore = await tonOf(minter.address);
+        const res = await minter.sendBatchMint(operator.getSender(), items, { value: requiredMintValue(total, MAX_BATCH) });
+        expect(res.transactions).toHaveTransaction({ from: operator.address, to: minter.address, aborted: true });
+        expect(res.transactions).toHaveTransaction({ from: minter.address, to: operator.address, inMessageBounced: true });
+        expect((await minter.getMinterData()).mintedToday).toBe(0);
+        expect(await tonOf(minter.address)).toBeGreaterThanOrEqual(minterBefore - toNano('0.001')); // nothing stays on the minter
+        expect(operatorBefore - (await tonOf(operator.address))).toBeLessThan(toNano('0.5')); // ~15 TON came back
+    });
+
+    it('if the collection cannot pay for the vouchers (fee spike), the TON returns to the operator and the counter is restored', async () => {
+        await minter.sendSetLimit(admin.getSender(), 1000);
+        scaleFees(blockchain, 4n); // fee_per_item / fee_per_call no longer cover the deploys, the collection itself holds ~0.1 TON
+        const operatorBefore = await tonOf(operator.address);
+        const collectionBefore = await tonOf(collection.address);
+        const res = await minter.sendBatchMint(operator.getSender(), batchOf(MAX_BATCH));
+        expect(res.transactions).toHaveTransaction({ from: minter.address, to: collection.address, aborted: true });
+        expect(res.transactions).toHaveTransaction({ from: collection.address, to: minter.address, inMessageBounced: true });
+        expect((await collection.getCollectionData()).nextItemIndex).toBe(0n);
+        expect((await minter.getMinterData()).mintedToday).toBe(0);
+        expect(await tonOf(collection.address)).toBeLessThanOrEqual(collectionBefore); // the collection has no withdrawal
+        expect(operatorBefore - (await tonOf(operator.address))).toBeLessThan(toNano('0.5'));
+    });
+
+    it('a repeated batch (e.g. a retry) is rejected by the collection: TON refunded, counter restored', async () => {
+        await minter.sendSetLimit(admin.getSender(), 1000);
+        const items = batchOf(3);
+        await minter.sendBatchMint(operator.getSender(), items);
+        const operatorBefore = await tonOf(operator.address);
+        const collectionBefore = await tonOf(collection.address);
+        const res = await minter.sendBatchMint(operator.getSender(), items);
+        expect(res.transactions).toHaveTransaction({ from: minter.address, to: collection.address, success: false, exitCode: 403 + 1 });
+        expect((await collection.getCollectionData()).nextItemIndex).toBe(3n);
+        expect((await minter.getMinterData()).mintedToday).toBe(3);
+        expect(await tonOf(collection.address)).toBeLessThanOrEqual(collectionBefore);
+        expect(operatorBefore - (await tonOf(operator.address))).toBeLessThan(toNano('0.05'));
+    });
+
+    it('the operator cannot add forward fields to a voucher (no notification on mint)', async () => {
+        // with forward_amount the new voucher would send ownership_assigned(prev_owner = collection) to its owner,
+        // e.g. make the redeemer pay GUM to the collection
+        const content = beginCell().storeAddress(alice.address).storeRef(kindContentCell('0.json')).storeCoins(toNano('0.15')).storeBit(false).endCell();
+        const single = beginCell().storeUint(MinterOpcodes.mint, 32).storeUint(0, 64).storeUint(0, 64).storeCoins(toNano('0.4')).storeRef(content).endCell();
+        expect((await operator.send({ to: minter.address, value: toNano('1'), body: single })).transactions).toHaveTransaction({
+            to: minter.address,
+            success: false,
+            exitCode: MinterErrors.badItem,
+        });
+        const RawItem: DictionaryValue<Cell> = {
+            serialize: (c, b) => b.storeCoins(toNano('0.4')).storeRef(c),
+            parse: () => {
+                throw new Error('unused');
+            },
+        };
+        const list = Dictionary.empty(Dictionary.Keys.BigUint(64), RawItem);
+        list.set(0n, content);
+        const batch = beginCell().storeUint(MinterOpcodes.batchMint, 32).storeUint(0, 64).storeRef(beginCell().storeDictDirect(list).endCell()).endCell();
+        expect((await operator.send({ to: minter.address, value: toNano('1'), body: batch })).transactions).toHaveTransaction({
+            to: minter.address,
+            success: false,
+            exitCode: MinterErrors.badItem,
+        });
+        expect((await collection.getCollectionData()).nextItemIndex).toBe(0n);
     });
 
     it('rejects unknown ops', async () => {

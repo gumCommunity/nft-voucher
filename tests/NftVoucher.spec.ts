@@ -2,7 +2,7 @@ import { Blockchain, SandboxContract, TreasuryContract } from '@ton/sandbox';
 import { beginCell, Cell, toNano } from '@ton/core';
 import { compile } from '@ton/blueprint';
 import '@ton/test-utils';
-import { CollectionErrors, NftVoucherCollection } from '../wrappers/NftVoucherCollection';
+import { CollectionErrors, itemAmount, NftVoucherCollection } from '../wrappers/NftVoucherCollection';
 import { ItemErrors, ItemOpcodes, NftVoucherItem } from '../wrappers/NftVoucherItem';
 
 const VOUCHER = toNano('10');
@@ -171,14 +171,54 @@ describe('NftVoucher', () => {
 
     it('collection admin cannot re-mint a burned index', async () => {
         await item.sendDestroy(alice.getSender());
-        await collection.sendMint(admin.getSender(), {
+        const res = await collection.sendMint(admin.getSender(), {
             itemIndex: 0,
             itemOwner: admin.address,
             itemContent: '0.json',
             voucherValue: toNano('1'),
         });
+        expect(res.transactions).toHaveTransaction({ from: admin.address, to: collection.address, success: false, exitCode: CollectionErrors.badIndex });
         expect(await item.getIsBurned()).toBe(true);
         expect((await item.getNftData()).ownerAddress).toBeNull();
+    });
+
+    it('accepts only next_item_index: a re-used index is rejected and its TON comes back', async () => {
+        const collectionBefore = await balanceOf(collection);
+        const adminBefore = await balanceOf(admin);
+        const res = await collection.sendMint(admin.getSender(), { itemIndex: 0, itemOwner: bob.address, itemContent: '1.json', voucherValue: toNano('5') });
+        expect(res.transactions).toHaveTransaction({ from: admin.address, to: collection.address, success: false, exitCode: CollectionErrors.badIndex });
+        expect(res.transactions).not.toHaveTransaction({ from: collection.address, to: item.address });
+        expect((await item.getNftData()).ownerAddress!.equals(alice.address)).toBe(true);
+        // nothing stays on the collection (it has no withdrawal), the 5 TON went back
+        expect(await balanceOf(collection)).toBeLessThanOrEqual(collectionBefore);
+        expect(adminBefore - (await balanceOf(admin))).toBeLessThan(toNano('0.05'));
+
+        const ahead = await collection.sendMint(admin.getSender(), { itemIndex: 5, itemOwner: bob.address, itemContent: '1.json', voucherValue: toNano('1') });
+        expect(ahead.transactions).toHaveTransaction({ to: collection.address, success: false, exitCode: CollectionErrors.badIndex });
+        expect((await collection.getCollectionData()).nextItemIndex).toBe(1n);
+    });
+
+    it('batch mint must continue from next_item_index without gaps', async () => {
+        const res = await collection.sendBatchMint(admin.getSender(), [
+            { itemIndex: 1, itemOwner: alice.address, itemContent: '1.json', voucherValue: toNano('1') },
+            { itemIndex: 3, itemOwner: alice.address, itemContent: '2.json', voucherValue: toNano('1') },
+        ]);
+        expect(res.transactions).toHaveTransaction({ to: collection.address, success: false, exitCode: 403 + 2 });
+        expect((await collection.getCollectionData()).nextItemIndex).toBe(1n);
+    });
+
+    it('a mint the collection cannot pay for bounces back: no vouchers, nothing stays on the collection', async () => {
+        const items = Array.from({ length: 100 }, (_, i) => ({ itemIndex: 1 + i, itemOwner: bob.address, itemContent: '2.json', voucherValue: toNano('0.1') }));
+        const amounts = items.reduce((a, i) => a + itemAmount(i), 0n);
+        const collectionBefore = await balanceOf(collection);
+        const adminBefore = await balanceOf(admin);
+        // less than the vouchers need: the action phase fails; without +16 all of it would stay on the collection
+        const res = await collection.sendBatchMint(admin.getSender(), items, { value: amounts - toNano('0.2') });
+        expect(res.transactions).toHaveTransaction({ from: admin.address, to: collection.address, aborted: true });
+        expect(res.transactions).toHaveTransaction({ from: collection.address, to: admin.address, inMessageBounced: true });
+        expect((await collection.getCollectionData()).nextItemIndex).toBe(1n);
+        expect(await balanceOf(collection)).toBeLessThanOrEqual(collectionBefore);
+        expect(adminBefore - (await balanceOf(admin))).toBeLessThan(toNano('0.1'));
     });
 
     it('top-up increases the voucher value', async () => {

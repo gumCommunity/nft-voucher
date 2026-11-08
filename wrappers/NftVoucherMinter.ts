@@ -24,20 +24,22 @@ export const MinterErrors = {
     notEnoughTon: 406,
     notPendingAdmin: 407,
     badBatch: 408,
+    badItem: 409,
     unknownOp: 0xffff,
 };
 
 /** What the minter forwards to the collection per voucher / per message (on top of voucher amounts). Admin can change it. */
 export const DEFAULT_FEE_PER_ITEM = toNano('0.002');
 export const DEFAULT_FEE_PER_CALL = toNano('0.005');
-/** Kept by the minter for its own gas and the refund message. */
-export const MINTER_FEE = toNano('0.01');
+/** Left for the minter's own gas and messages: base + per voucher (same constants as in the contract; unused part is refunded). */
+export const MINTER_FEE_BASE = toNano('0.01');
+export const MINTER_FEE_PER_ITEM = toNano('0.001');
 export const MAX_BATCH = 100;
 export const PERIOD_SECONDS = 86400;
 
 /** Minimum the operator must attach; anything above it is refunded. */
 export function requiredMintValue(totalAmount: bigint, count: number, feePerItem = DEFAULT_FEE_PER_ITEM, feePerCall = DEFAULT_FEE_PER_CALL) {
-    return totalAmount + BigInt(count) * feePerItem + feePerCall + MINTER_FEE;
+    return totalAmount + BigInt(count) * (feePerItem + MINTER_FEE_PER_ITEM) + feePerCall + MINTER_FEE_BASE;
 }
 /** Default attached value: required + margin (the unused part comes back to the operator). */
 const withMargin = (totalAmount: bigint, count: number) => requiredMintValue(totalAmount, count) + toNano('0.02') + BigInt(count) * toNano('0.002');
