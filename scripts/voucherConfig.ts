@@ -2,9 +2,10 @@
 export const COLLECTION_CONTENT_URL = 'https://cdn.gumcoin.org/vouchers/collection.json';
 export const COMMON_CONTENT_URL = 'https://cdn.gumcoin.org/vouchers/';
 
-// Default royalty for marketplace sales: ROYALTY_FACTOR / ROYALTY_BASE = 5 / 100 = 5%.
-// Paid to the deployer wallet unless ROYALTY_ADDRESS is set. Can be changed later with changeRoyalty.
-export const ROYALTY_FACTOR = 5;
+// Default royalty for marketplace sales: ROYALTY_FACTOR / ROYALTY_BASE = 0 / 100 = 0%.
+// (e.g. 5 / 100 = 5%). Paid to the deployer wallet unless ROYALTY_ADDRESS is set.
+// Can be changed later at any time with changeRoyalty.
+export const ROYALTY_FACTOR = 0;
 export const ROYALTY_BASE = 100;
 export const ROYALTY_ADDRESS: string | null = null;
 

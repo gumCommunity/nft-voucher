@@ -38,7 +38,7 @@ describe('NftVoucher', () => {
                     collectionContentUrl: 'https://cdn.gumcoin.org/vouchers/collection.json',
                     commonContentUrl: 'https://cdn.gumcoin.org/vouchers/',
                     nftItemCode: itemCode,
-                    royaltyParams: { royaltyFactor: 5, royaltyBase: 100, royaltyAddress: admin.address }, // 5% default
+                    royaltyParams: { royaltyFactor: 0, royaltyBase: 100, royaltyAddress: admin.address }, // 0% default
                 },
                 collectionCode,
             ),
@@ -227,9 +227,9 @@ describe('NftVoucher', () => {
         expect((await collection.getCollectionData()).nextItemIndex).toBe(2n);
     });
 
-    it('has 5% royalty by default', async () => {
+    it('has 0% royalty by default', async () => {
         const r = await collection.getRoyaltyParams();
-        expect([r.royaltyFactor, r.royaltyBase]).toEqual([5, 100]);
+        expect([r.royaltyFactor, r.royaltyBase]).toEqual([0, 100]);
         expect(r.royaltyAddress.equals(admin.address)).toBe(true);
     });
 
@@ -263,7 +263,7 @@ describe('NftVoucher', () => {
             royaltyParams: { royaltyFactor: 50, royaltyBase: 100, royaltyAddress: bob.address },
         });
         expect(res.transactions).toHaveTransaction({ from: bob.address, to: collection.address, success: false, exitCode: CollectionErrors.notOwner });
-        expect((await collection.getRoyaltyParams()).royaltyFactor).toBe(5);
+        expect((await collection.getRoyaltyParams()).royaltyFactor).toBe(0);
     });
 
     it.each([
@@ -276,7 +276,7 @@ describe('NftVoucher', () => {
             royaltyParams: { royaltyFactor: factor, royaltyBase: base, royaltyAddress: admin.address },
         });
         expect(res.transactions).toHaveTransaction({ to: collection.address, success: false, exitCode: CollectionErrors.invalidRoyalty });
-        expect((await collection.getRoyaltyParams()).royaltyFactor).toBe(5);
+        expect((await collection.getRoyaltyParams()).royaltyFactor).toBe(0);
     });
 
     it('only collection owner can mint', async () => {

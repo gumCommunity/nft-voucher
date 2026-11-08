@@ -88,7 +88,7 @@ On mint the item receives `voucherValue + 0.05 TON` (storage reserve). Up to 249
 - Collection ownership can be transferred with `changeCollectionOwner` (op 3). It is one step and immediate, so the script
   asks for the new address twice and refuses obviously wrong ones. The redeemer recognises vouchers by the collection
   address, so changing the owner does not affect it.
-- **Royalty** is 5% to the deployer by default (`ROYALTY_*` in `scripts/voucherConfig.ts`). The owner can change the percent
+- **Royalty** is 0% by default (`ROYALTY_*` in `scripts/voucherConfig.ts`; the receiver is the deployer). The owner can change the percent
   and the receiver at any time with `changeRoyalty` (op 4 keeps the metadata URLs; the contract rejects more than 100%,
   error `410`). Royalty is honoured by marketplaces (they read `royalty_params`); direct wallet transfers pay none.
   Changing the owner does not change the royalty receiver.
