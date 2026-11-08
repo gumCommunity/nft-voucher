@@ -63,6 +63,7 @@ npm test             # tests in @ton/sandbox
 npx blueprint run deployNftVoucherCollection --testnet
 npx blueprint run mintVoucher <collection_address> --testnet   # asks kind, owner and TON value
 npx blueprint run burnVoucher <item_address> --testnet
+npx blueprint run changeCollectionOwner <collection_address> --testnet   # transfer the right to mint
 ```
 
 From code:
@@ -82,6 +83,9 @@ On mint the item receives `voucherValue + 0.05 TON` (storage reserve). Up to 249
 
 - If you change `nft_voucher_item.fc`, update the pinned item code in `voucher-redeemer` as well, otherwise the redeemer will not recognise the new items.
 - The collection owner is fully trusted: they mint vouchers and decide how much TON goes into each one.
+- Collection ownership can be transferred with `changeCollectionOwner` (op 3). It is one step and immediate, so the script
+  asks for the new address twice and refuses obviously wrong ones. The royalty address set at deploy does not change
+  (royalty is 0%). The redeemer recognises vouchers by the collection address, so changing the owner does not affect it.
 - Test on testnet first and get an audit before mainnet: the NFTs hold real value.
 
 ## License

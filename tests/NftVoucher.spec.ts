@@ -211,6 +211,22 @@ describe('NftVoucher', () => {
         }
     });
 
+    it('collection owner can be changed; only the new owner can mint', async () => {
+        expect((await collection.sendChangeOwner(alice.getSender(), alice.address)).transactions).toHaveTransaction({
+            from: alice.address,
+            to: collection.address,
+            success: false,
+            exitCode: 401,
+        });
+        await collection.sendChangeOwner(admin.getSender(), bob.address);
+        expect((await collection.getCollectionData()).ownerAddress.equals(bob.address)).toBe(true);
+
+        const old = await collection.sendMint(admin.getSender(), { itemIndex: 1, itemOwner: admin.address, itemContent: '1.json', voucherValue: toNano('1') });
+        expect(old.transactions).toHaveTransaction({ from: admin.address, to: collection.address, success: false, exitCode: 401 });
+        await collection.sendMint(bob.getSender(), { itemIndex: 1, itemOwner: alice.address, itemContent: '1.json', voucherValue: toNano('1') });
+        expect((await collection.getCollectionData()).nextItemIndex).toBe(2n);
+    });
+
     it('only collection owner can mint', async () => {
         const res = await collection.sendMint(alice.getSender(), {
             itemIndex: 1,
