@@ -4,7 +4,7 @@ import { compile } from '@ton/blueprint';
 import '@ton/test-utils';
 import { NftVoucherCollection } from '../wrappers/NftVoucherCollection';
 import { NftVoucherItem } from '../wrappers/NftVoucherItem';
-import { MinterErrors, NftVoucherMinter } from '../wrappers/NftVoucherMinter';
+import { MAX_BATCH, MinterErrors, NftVoucherMinter, requiredMintValue } from '../wrappers/NftVoucherMinter';
 
 const KINDS = ['0.json', '1.json', '2.json'];
 
@@ -150,11 +150,74 @@ describe('NftVoucherMinter', () => {
         expect(badKind.transactions).toHaveTransaction({ to: minter.address, success: false, exitCode: MinterErrors.kindNotAllowed });
     });
 
+    it('forwards only what the collection needs and refunds the rest to the operator', async () => {
+        const items = Array.from({ length: 3 }, (_, i) => ({ itemIndex: i, itemOwner: alice.address, itemContent: KINDS[i], voucherValue: toNano('0.1') }));
+        const amounts = items.length * Number(toNano('0.15')); // voucher value + 0.05 storage reserve each
+        const minterBefore = (await blockchain.getContract(minter.address)).balance;
+        const colBefore = (await blockchain.getContract(collection.address)).balance;
+        const opBefore = (await blockchain.getContract(operator.address)).balance;
+
+        const res = await minter.sendBatchMint(operator.getSender(), items, { value: toNano('5') }); // heavy overpay
+        expect(res.transactions).toHaveTransaction({ from: minter.address, to: operator.address, op: 0xd53276db, value: (v) => v! > toNano('4.4') });
+        expect((await collection.getCollectionData()).nextItemIndex).toBe(3n);
+
+        const spent = opBefore - (await blockchain.getContract(operator.address)).balance;
+        expect(spent - BigInt(amounts)).toBeLessThan(toNano('0.03')); // fees + what stays on the collection
+        expect((await blockchain.getContract(collection.address)).balance - colBefore).toBeLessThan(toNano('0.01'));
+        expect((await blockchain.getContract(minter.address)).balance).toBeGreaterThanOrEqual(minterBefore - toNano('0.001'));
+    });
+
+    it(`accepts batches up to ${MAX_BATCH} vouchers`, async () => {
+        await minter.sendSetLimit(admin.getSender(), 1000);
+        const items = (n: number, start: number) =>
+            Array.from({ length: n }, (_, i) => ({ itemIndex: start + i, itemOwner: alice.address, itemContent: KINDS[i % 3], voucherValue: toNano('0.1') }));
+        const tooBig = await minter.sendBatchMint(operator.getSender(), items(MAX_BATCH + 1, 0));
+        expect(tooBig.transactions).toHaveTransaction({ to: minter.address, success: false, exitCode: MinterErrors.badBatch });
+
+        const ok = await minter.sendBatchMint(operator.getSender(), items(MAX_BATCH, 0));
+        expect(ok.transactions).not.toHaveTransaction({ success: false });
+        expect((await collection.getCollectionData()).nextItemIndex).toBe(BigInt(MAX_BATCH));
+        expect((await minter.getMinterData()).mintedToday).toBe(MAX_BATCH);
+    });
+
+    it('requires at least amount + fees', async () => {
+        const need = requiredMintValue(toNano('0.15'), 1);
+        expect((await mint(operator, '0.json', alice.address, { value: need - 1n })).transactions).toHaveTransaction({
+            to: minter.address,
+            exitCode: MinterErrors.notEnoughTon,
+        });
+        expect((await mint(operator, '0.json', alice.address, { value: need })).transactions).toHaveTransaction({
+            from: minter.address,
+            to: collection.address,
+            success: true,
+        });
+    });
+
+    it('admin changes the collection fees (too low fees are paid from the collection balance)', async () => {
+        expect((await minter.sendSetFees(operator.getSender(), 0n, 0n)).transactions).toHaveTransaction({ to: minter.address, exitCode: MinterErrors.notAdmin });
+
+        await minter.sendSetFees(admin.getSender(), 0n, 0n);
+        const d = await minter.getMinterData();
+        expect([d.feePerItem, d.feePerCall]).toEqual([0n, 0n]);
+        const colBefore = (await blockchain.getContract(collection.address)).balance;
+        await mintOk();
+        // the collection covered the deploy fees from its own TON
+        expect((await blockchain.getContract(collection.address)).balance).toBeLessThan(colBefore);
+
+        await minter.sendSetFees(admin.getSender(), toNano('0.002'), toNano('0.005'));
+        const colBefore2 = (await blockchain.getContract(collection.address)).balance;
+        await mintOk();
+        // with the default fees the collection does not lose TON
+        expect((await blockchain.getContract(collection.address)).balance).toBeGreaterThanOrEqual(colBefore2);
+    });
+
     it('restores the counter when the collection rejects a mint', async () => {
         const res = await mint(operator, '0.json', alice.address, { index: 5 }); // index ahead of next_item_index
         expect(res.transactions).toHaveTransaction({ from: minter.address, to: collection.address, success: false, exitCode: 402 });
         expect(res.transactions).toHaveTransaction({ from: collection.address, to: minter.address, inMessageBounced: true });
         expect((await minter.getMinterData()).mintedToday).toBe(0);
+        // the returned TON goes on to the operator
+        expect(res.transactions).toHaveTransaction({ from: minter.address, to: operator.address, op: 0xd53276db, value: (v) => v! > toNano('0.1') });
     });
 
     it('pause stops the operator', async () => {

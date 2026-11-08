@@ -9,7 +9,9 @@
 ;;    * operator (hot key, e.g. a server): can ONLY mint vouchers through the minter
 ;;        - only allowed voucher kinds (item content cell hash in `kinds`)
 ;;        - at most `limit` vouchers per 24-hour window
-;;        - pays the TON for the vouchers itself (the minter's balance is never used)
+;;        - pays the TON for the vouchers itself (the minter's balance is never used);
+;;          only what the collection needs is forwarded, the rest is refunded to the operator
+;;        - batches of up to 100 vouchers (collection gas limit)
 ;;    * admin (cold wallet): everything else
 ;;        - replace / disable the operator, pause minting, change the limit and allowed kinds
 ;;        - send any message to the collection as its owner (change owner -> move the collection
@@ -31,6 +33,7 @@ int op::minter_set_kind() asm "0x26796708 PUSHINT";
 int op::minter_collection_call() asm "0x75f071b1 PUSHINT";
 int op::minter_withdraw_ton() asm "0x1c88f70d PUSHINT";
 int op::minter_propose_admin() asm "0x3d8bf3c0 PUSHINT";
+int op::minter_set_fees() asm "0x51c21fc0 PUSHINT";
 int op::minter_accept_admin() asm "0x26728af0 PUSHINT";
 
 int op::collection_mint() asm "1 PUSHINT";
@@ -50,12 +53,13 @@ int error::unknown_op() asm "0xffff PUSHINT";
 
 ;; ---------- constants ----------
 int period() asm "86400 PUSHINT";                ;; 24 hours
-int mint_fee_per_item() asm "30000000 PUSHINT";  ;; 0.03 TON per voucher on top of its amount (collection gas + deploy fees)
+int max_batch() asm "100 PUSHINT";               ;; collection gas limit allows ~140 deploys per message
+int minter_fee() asm "10000000 PUSHINT";         ;; 0.01 TON for the minter's own gas and the refund message
 int min_storage() asm "50000000 PUSHINT";        ;; 0.05 TON kept on withdraw_ton
 
 ;; ---------- storage ----------
 ;; admin:MsgAddress operator:MsgAddress paused:Bool limit:uint32 period_start:uint32 minted:uint32
-;; ^[ collection:MsgAddress pending_admin:MsgAddress kinds:(HashmapE 256 Cell) ]
+;; ^[ collection:MsgAddress pending_admin:MsgAddress kinds:(HashmapE 256 Cell) fee_per_item:Coins fee_per_call:Coins ]
 
 global slice storage::admin;
 global slice storage::operator;          ;; addr_none = minting by operator disabled
@@ -66,6 +70,8 @@ global int   storage::minted;            ;; vouchers minted by the operator in t
 global slice storage::collection;
 global slice storage::pending_admin;     ;; addr_none when no admin change is pending
 global cell  storage::kinds;             ;; cell_hash(item content) -> empty
+global int   storage::fee_per_item;      ;; TON the collection needs per voucher (deploy message + gas)
+global int   storage::fee_per_call;      ;; TON the collection needs per mint message
 
 () load_data() impure inline {
     slice ds = get_data().begin_parse();
@@ -79,6 +85,8 @@ global cell  storage::kinds;             ;; cell_hash(item content) -> empty
     storage::collection = r~load_msg_addr();
     storage::pending_admin = r~load_msg_addr();
     storage::kinds = r~load_dict();
+    storage::fee_per_item = r~load_coins();
+    storage::fee_per_call = r~load_coins();
 }
 
 () save_data() impure inline {
@@ -93,6 +101,8 @@ global cell  storage::kinds;             ;; cell_hash(item content) -> empty
             .store_slice(storage::collection)
             .store_slice(storage::pending_admin)
             .store_dict(storage::kinds)
+            .store_coins(storage::fee_per_item)
+            .store_coins(storage::fee_per_call)
             .end_cell())
         .end_cell());
 }
@@ -141,6 +151,26 @@ int kind_allowed?(cell content) inline {
     save_data();
 }
 
+;; Everything that is left of the incoming value (minus what was sent before) goes back to `to`.
+;; Must be preceded by raw_reserve of the balance before this message.
+() refund_rest(slice to, int query_id) impure inline {
+    send_raw_message(begin_cell()
+        .store_uint(0x10, 6).store_slice(to).store_coins(0)
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_uint(op::excesses(), 32).store_uint(query_id, 64)
+        .end_cell(), 128 + 2); ;; ignore errors: if nothing is left, the mint still goes through
+}
+
+;; Forwards an operator mint to the collection with exactly amount + fees, refunds the rest.
+() forward_mint(int my_balance, int msg_value, int count, int total_amount, cell body, int query_id) impure inline {
+    int to_collection = total_amount + count * storage::fee_per_item + storage::fee_per_call;
+    throw_unless(error::not_enough_ton(), msg_value >= to_collection + minter_fee());
+    count_mint(count);
+    raw_reserve(my_balance - msg_value, 0); ;; the minter's own balance is never spent
+    send_body_ref(storage::collection, to_collection, body, 1, -1);
+    refund_rest(storage::operator, query_id);
+}
+
 ;; ---------- entry point ----------
 
 () recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
@@ -156,6 +186,10 @@ int kind_allowed?(cell content) inline {
         if (((op == op::collection_mint()) | (op == op::collection_batch_mint())) & equal_slices(sender, storage::collection)) {
             storage::minted = max(0, storage::minted - in_msg_body~load_uint(64));
             save_data();
+            if (~ is_addr_none(storage::operator)) { ;; give the returned TON back to the operator
+                raw_reserve(my_balance - msg_value, 0);
+                refund_rest(storage::operator, 0);
+            }
         }
         return ();
     }
@@ -179,15 +213,13 @@ int kind_allowed?(cell content) inline {
         int amount = in_msg_body~load_coins();
         cell nft_content = in_msg_body~load_ref();
         check_item(nft_content);
-        throw_unless(error::not_enough_ton(), msg_value >= amount + mint_fee_per_item());
-        count_mint(1);
-        send_body_ref(storage::collection, 0, begin_cell()
+        forward_mint(my_balance, msg_value, 1, amount, begin_cell()
             .store_uint(op::collection_mint(), 32)
             .store_uint(1, 64) ;; query_id = number of vouchers (for bounce)
             .store_uint(item_index, 64)
             .store_coins(amount)
             .store_ref(nft_content)
-            .end_cell(), 64, -1);
+            .end_cell(), query_id);
         return ();
     }
     if (op == op::minter_batch_mint()) {
@@ -205,14 +237,12 @@ int kind_allowed?(cell content) inline {
                 check_item(item~load_ref());
             }
         } until (~ f?);
-        throw_unless(error::bad_batch(), (count > 0) & (count < 250));
-        throw_unless(error::not_enough_ton(), msg_value >= total + count * mint_fee_per_item());
-        count_mint(count);
-        send_body_ref(storage::collection, 0, begin_cell()
+        throw_unless(error::bad_batch(), (count > 0) & (count <= max_batch()));
+        forward_mint(my_balance, msg_value, count, total, begin_cell()
             .store_uint(op::collection_batch_mint(), 32)
             .store_uint(count, 64) ;; query_id = number of vouchers (for bounce)
             .store_ref(deploy_list)
-            .end_cell(), 64, -1);
+            .end_cell(), query_id);
         return ();
     }
 
@@ -258,6 +288,12 @@ int kind_allowed?(cell content) inline {
         save_data();
         return ();
     }
+    if (op == op::minter_set_fees()) {
+        storage::fee_per_item = in_msg_body~load_coins();
+        storage::fee_per_call = in_msg_body~load_coins();
+        save_data();
+        return ();
+    }
     if (op == op::minter_collection_call()) {
         ;; any message to the collection on behalf of its owner (op 3 change owner, op 4 royalty/content, op 1/2 mint)
         ;; non-bounceable, so a failing call can never touch the operator's counter
@@ -298,8 +334,9 @@ int kind_allowed?(cell content) inline {
 
 ;; ---------- get methods ----------
 
-;; (admin, pending_admin, operator, collection, paused, limit, minted_in_current_period, period_ends_at)
-(slice, slice, slice, slice, int, int, int, int) get_minter_data() method_id {
+;; (admin, pending_admin, operator, collection, paused, limit, minted_in_current_period, period_ends_at,
+;;  fee_per_item, fee_per_call)
+(slice, slice, slice, slice, int, int, int, int, int, int) get_minter_data() method_id {
     load_data();
     int minted = storage::minted;
     int ends = storage::period_start + period();
@@ -308,7 +345,7 @@ int kind_allowed?(cell content) inline {
         ends = now() + period();
     }
     return (storage::admin, storage::pending_admin, storage::operator, storage::collection,
-            storage::paused, storage::limit, minted, ends);
+            storage::paused, storage::limit, minted, ends, storage::fee_per_item, storage::fee_per_call);
 }
 
 int is_kind_allowed(int content_hash) method_id {

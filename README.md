@@ -54,7 +54,7 @@ operator (server key) ──"mint a voucher" only──> Minter
 | mint vouchers through the minter (`minter_mint`, `minter_batch_mint`) | replace or disable the operator |
 | only allowed kinds (`0.json`, `1.json`, `2.json`) | pause minting |
 | at most **N vouchers per 24 h** | change the daily limit and allowed kinds |
-| paying the TON itself (the minter balance is never used) | change royalty / metadata, transfer the collection (to a new minter or a wallet) |
+| paying the TON itself (the minter balance is never used; the surplus is refunded) | change royalty / metadata, transfer the collection (to a new minter or a wallet) |
 | | withdraw TON; change admin in **two steps** (propose → the new admin accepts) |
 
 If the server key leaks: at most N vouchers per day can be minted until the admin replaces the operator (one transaction).
@@ -62,20 +62,37 @@ The redeemer is not affected by any of this: it recognises vouchers by the colle
 
 | Op | Code | Who |
 |---|---|---|
-| `minter_mint` | `0x2eb92088` | operator: `query_id item_index:uint64 amount:Coins ^nft_content` (attach `amount + 0.03 TON`) |
-| `minter_batch_mint` | `0x76671074` | operator: `query_id ^deploy_list` (same dict as collection op 2, up to 249) |
+| `minter_mint` | `0x2eb92088` | operator: `query_id item_index:uint64 amount:Coins ^nft_content` |
+| `minter_batch_mint` | `0x76671074` | operator: `query_id ^deploy_list` (same dict as collection op 2, **up to 100**) |
 | `minter_set_operator` | `0x25745a78` | admin (`addr_none` disables) |
 | `minter_set_paused` | `0x5ce84131` | admin |
 | `minter_set_limit` | `0x1907b1ec` | admin, vouchers per 24 h |
 | `minter_set_kind` | `0x26796708` | admin: `content_hash:uint256 allowed:Bool` |
 | `minter_collection_call` | `0x75f071b1` | admin: any `^body` to the collection as its owner (op 3 change owner, op 4 royalty, …) |
+| `minter_set_fees` | `0x51c21fc0` | admin: `per_item:Coins per_call:Coins` forwarded to the collection |
 | `minter_withdraw_ton` | `0x1c88f70d` | admin (`0` = all except 0.05 TON) |
 | `minter_propose_admin` / `minter_accept_admin` | `0x3d8bf3c0` / `0x26728af0` | admin proposes, the new admin accepts |
 
 Errors: `401` not admin, `402` not operator, `403` paused, `404` kind not allowed, `405` daily limit reached,
-`406` not enough TON attached, `407` not the pending admin, `408` empty or too large batch.
+`406` not enough TON attached, `407` not the pending admin, `408` empty batch or more than 100 vouchers.
 Get methods: `get_minter_data` (admin, pending admin, operator, collection, paused, limit, minted in the current window,
-window end), `is_kind_allowed(content_hash)`.
+window end, fee per voucher, fee per message), `is_kind_allowed(content_hash)`.
+
+**TON and fees.** The operator attaches at least `sum(amounts) + count × fee_per_item + fee_per_call + 0.01 TON`
+(`requiredMintValue` in the wrapper). The minter forwards `sum(amounts) + count × fee_per_item + fee_per_call` to the
+collection and refunds everything else to the operator. Defaults: 0.002 TON per voucher + 0.005 TON per message
+(about 2× what the collection really spends; the small surplus stays on the collection, which has no withdraw).
+If the collection rejects a mint, the TON comes back to the operator. If network fees ever rise above the configured
+fees, the collection pays the difference from its own balance until it runs out, so raise them with `manageMinter`.
+
+Measured in the sandbox, without the TON put inside the vouchers:
+
+| 20 vouchers | fees + left on the collection |
+|---|---|
+| one by one (`minter_mint` × 20) | ~0.17 TON |
+| one batch (`minter_batch_mint`) | **~0.05 TON** |
+
+Batches are capped at 100: the collection deploys ~140 items per message before hitting the gas limit.
 
 The 24-hour window starts with the first mint after the previous window ended, so in the worst case 2 × N vouchers can be
 minted within a short time around the window boundary. If the collection rejects an operator mint, the counter is restored.
@@ -92,10 +109,13 @@ npx blueprint run mintViaMinter <minter> --testnet               # mint as the o
 `MINTER_LIMIT_PER_DAY` in `scripts/voucherConfig.ts` sets the limit (if `null`, `deployMinter` asks).
 Once the minter owns the collection, `mintVoucher`, `changeRoyalty` and `changeCollectionOwner` point you to `manageMinter`.
 
-**Server.** [`examples/serverMint.ts`](examples/serverMint.ts) mints with the operator mnemonic from the environment
-(`@ton/ton`, no Blueprint). Alternatively `WALLET_MNEMONIC=... WALLET_VERSION=v4 npx blueprint run mintViaMinter --mnemonic …`.
-Mint one voucher at a time (or use batch mint): the item index is read from the collection, and two mints with the same
-index produce only one voucher.
+**Server.** [`examples/serverMint.ts`](examples/serverMint.ts) has `mintPending(requests)`: collect requests (e.g. once a
+minute) and call it — it sends them in batches of up to 100 in one transaction each, waits for the collection, respects
+the daily limit and pause, and returns the requests that did not fit for the next run. It uses the operator mnemonic from
+the environment (`@ton/ton`, no Blueprint) and is covered by `tests/ServerMintExample.spec.ts`.
+For a one-off mint: `WALLET_MNEMONIC=... WALLET_VERSION=v4 npx blueprint run mintViaMinter --mnemonic …`.
+Run one `mintPending` at a time: item indexes are read from the collection, and two concurrent mints with the same index
+produce only one voucher.
 
 ## Metadata (Gumcoin Vouchers)
 

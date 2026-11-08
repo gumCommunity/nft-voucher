@@ -12,6 +12,7 @@ export const MinterOpcodes = {
     withdrawTon: 0x1c88f70d,
     proposeAdmin: 0x3d8bf3c0,
     acceptAdmin: 0x26728af0,
+    setFees: 0x51c21fc0,
 };
 
 export const MinterErrors = {
@@ -26,9 +27,20 @@ export const MinterErrors = {
     unknownOp: 0xffff,
 };
 
-/** TON per voucher the operator must attach on top of the voucher amount (collection gas + deploy fees). */
-export const MINT_FEE_PER_ITEM = toNano('0.03');
+/** What the minter forwards to the collection per voucher / per message (on top of voucher amounts). Admin can change it. */
+export const DEFAULT_FEE_PER_ITEM = toNano('0.002');
+export const DEFAULT_FEE_PER_CALL = toNano('0.005');
+/** Kept by the minter for its own gas and the refund message. */
+export const MINTER_FEE = toNano('0.01');
+export const MAX_BATCH = 100;
 export const PERIOD_SECONDS = 86400;
+
+/** Minimum the operator must attach; anything above it is refunded. */
+export function requiredMintValue(totalAmount: bigint, count: number, feePerItem = DEFAULT_FEE_PER_ITEM, feePerCall = DEFAULT_FEE_PER_CALL) {
+    return totalAmount + BigInt(count) * feePerItem + feePerCall + MINTER_FEE;
+}
+/** Default attached value: required + margin (the unused part comes back to the operator). */
+const withMargin = (totalAmount: bigint, count: number) => requiredMintValue(totalAmount, count) + toNano('0.02') + BigInt(count) * toNano('0.002');
 
 /** Item content cell exactly as stored in the item ("0.json" etc.). */
 export const kindContentCell = (suffix: string) => beginCell().storeStringTail(suffix).endCell();
@@ -41,6 +53,8 @@ export type NftVoucherMinterConfig = {
     limitPerDay: number;
     kinds: string[]; // allowed item content suffixes
     paused?: boolean;
+    feePerItem?: bigint;
+    feePerCall?: bigint;
 };
 
 export function nftVoucherMinterConfigToCell(c: NftVoucherMinterConfig): Cell {
@@ -53,7 +67,15 @@ export function nftVoucherMinterConfigToCell(c: NftVoucherMinterConfig): Cell {
         .storeUint(c.limitPerDay, 32)
         .storeUint(0, 32) // period_start
         .storeUint(0, 32) // minted
-        .storeRef(beginCell().storeAddress(c.collection).storeAddress(null).storeDict(kinds).endCell())
+        .storeRef(
+            beginCell()
+                .storeAddress(c.collection)
+                .storeAddress(null)
+                .storeDict(kinds)
+                .storeCoins(c.feePerItem ?? DEFAULT_FEE_PER_ITEM)
+                .storeCoins(c.feePerCall ?? DEFAULT_FEE_PER_CALL)
+                .endCell(),
+        )
         .endCell();
 }
 
@@ -78,10 +100,10 @@ export class NftVoucherMinter implements Contract {
 
     // ---------- operator ----------
 
-    /** Mint one voucher. `value` defaults to voucherValue + storage reserve + 0.03 TON fee. */
+    /** Mint one voucher. The unused part of `value` is refunded to the operator. */
     async sendMint(provider: ContractProvider, via: Sender, p: MintParams & { value?: bigint; queryId?: number }) {
         await provider.internal(via, {
-            value: p.value ?? itemAmount(p) + MINT_FEE_PER_ITEM,
+            value: p.value ?? withMargin(itemAmount(p), 1),
             sendMode: SendMode.PAY_GAS_SEPARATELY,
             body: beginCell()
                 .storeUint(MinterOpcodes.mint, 32)
@@ -93,13 +115,13 @@ export class NftVoucherMinter implements Contract {
         });
     }
 
-    /** Mint up to 249 vouchers in one message. */
+    /** Mint up to MAX_BATCH (100) vouchers in one message. The unused part of `value` is refunded. */
     async sendBatchMint(provider: ContractProvider, via: Sender, items: MintParams[], opts?: { value?: bigint; queryId?: number }) {
         const dict = Dictionary.empty(Dictionary.Keys.BigUint(64), MintDictValue);
         for (const i of items) dict.set(BigInt(i.itemIndex), i);
-        const total = items.reduce((a, i) => a + itemAmount(i) + MINT_FEE_PER_ITEM, 0n);
+        const total = items.reduce((a, i) => a + itemAmount(i), 0n);
         await provider.internal(via, {
-            value: opts?.value ?? total,
+            value: opts?.value ?? withMargin(total, items.length),
             sendMode: SendMode.PAY_GAS_SEPARATELY,
             body: beginCell()
                 .storeUint(MinterOpcodes.batchMint, 32)
@@ -160,6 +182,11 @@ export class NftVoucherMinter implements Contract {
         return this.sendCollectionCall(provider, via, body);
     }
 
+    /** TON forwarded to the collection per voucher and per message (raise it if network fees go up). */
+    sendSetFees(provider: ContractProvider, via: Sender, feePerItem: bigint, feePerCall: bigint) {
+        return this.admin(provider, via, MinterOpcodes.setFees, (b) => b.storeCoins(feePerItem).storeCoins(feePerCall));
+    }
+
     /** amount = 0 withdraws everything except 0.05 TON. */
     sendWithdrawTon(provider: ContractProvider, via: Sender, amount = 0n) {
         return this.admin(provider, via, MinterOpcodes.withdrawTon, (b) => b.storeCoins(amount));
@@ -187,7 +214,21 @@ export class NftVoucherMinter implements Contract {
         const limit = s.readNumber();
         const mintedToday = s.readNumber();
         const periodEndsAt = s.readNumber();
-        return { admin, pendingAdmin, operator, collection, paused, limit, mintedToday, remainingToday: Math.max(0, limit - mintedToday), periodEndsAt };
+        const feePerItem = s.readBigNumber();
+        const feePerCall = s.readBigNumber();
+        return {
+            admin,
+            pendingAdmin,
+            operator,
+            collection,
+            paused,
+            limit,
+            mintedToday,
+            remainingToday: Math.max(0, limit - mintedToday),
+            periodEndsAt,
+            feePerItem,
+            feePerCall,
+        };
     }
 
     async getIsKindAllowed(provider: ContractProvider, suffix: string): Promise<boolean> {

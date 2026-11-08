@@ -1,7 +1,7 @@
 import { Address, toNano } from '@ton/core';
 import { NetworkProvider } from '@ton/blueprint';
 import { NftVoucherCollection } from '../wrappers/NftVoucherCollection';
-import { NftVoucherMinter } from '../wrappers/NftVoucherMinter';
+import { NftVoucherMinter, requiredMintValue } from '../wrappers/NftVoucherMinter';
 import { NftVoucherItem } from '../wrappers/NftVoucherItem';
 import { VOUCHER_KINDS } from './voucherConfig';
 
@@ -29,7 +29,9 @@ export async function run(provider: NetworkProvider, args: string[]) {
     ui.write(`Minting #${nextItemIndex} ${kind.name} for ${owner.toString()} (${d.remainingToday} left today)`);
 
     // mint sequentially: two mints with the same index produce only one voucher
-    await minter.sendMint(provider.sender(), { itemIndex: nextItemIndex, itemOwner: owner, itemContent: kind.content, voucherValue });
+    // attach what the minter requires (+ margin); the unused part is refunded
+    const value = requiredMintValue(voucherValue + toNano('0.05'), 1, d.feePerItem, d.feePerCall) + toNano('0.02');
+    await minter.sendMint(provider.sender(), { itemIndex: nextItemIndex, itemOwner: owner, itemContent: kind.content, voucherValue, value });
 
     const itemAddress = await collection.getNftAddressByIndex(nextItemIndex);
     await provider.waitForDeploy(itemAddress);

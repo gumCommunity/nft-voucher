@@ -1,4 +1,4 @@
-import { Address, toNano } from '@ton/core';
+import { Address, fromNano, toNano } from '@ton/core';
 import { NetworkProvider } from '@ton/blueprint';
 import { NftVoucherCollection } from '../wrappers/NftVoucherCollection';
 import { NftVoucherMinter } from '../wrappers/NftVoucherMinter';
@@ -31,6 +31,7 @@ export async function run(provider: NetworkProvider, args: string[]) {
     ui.write(`Vouchers minted: ${col.nextItemIndex}`);
     ui.write(`Royalty:         ${pct(royalty.royaltyFactor, royalty.royaltyBase)} to ${royalty.royaltyAddress.toString()}`);
     ui.write(`TON on minter:   ${Number(ton) / 1e9}`);
+    ui.write(`Collection fees: ${fromNano(d.feePerItem)} TON per voucher + ${fromNano(d.feePerCall)} TON per message`);
 
     const isAdmin = d.admin.equals(me);
     const isPending = !!d.pendingAdmin && d.pendingAdmin.equals(me);
@@ -54,6 +55,7 @@ export async function run(provider: NetworkProvider, args: string[]) {
             'allow voucher kind',
             'forbid voucher kind',
             'change royalty',
+            'set collection fees',
             'transfer collection ownership',
             'withdraw TON',
             d.pendingAdmin ? 'cancel pending admin change' : 'propose new admin',
@@ -109,6 +111,19 @@ export async function run(provider: NetworkProvider, args: string[]) {
                 const r = await collection.getRoyaltyParams();
                 return r.royaltyFactor === factor && r.royaltyBase === base && r.royaltyAddress.equals(receiver);
             }, ui, 'Royalty changed.');
+            break;
+        }
+        case 'set collection fees': {
+            ui.write('TON the minter forwards to the collection on top of voucher amounts. Too low = the collection pays');
+            ui.write('the difference from its own balance (and minting fails when it runs out); too high = the surplus stays on the collection.');
+            const item = toNano((await ui.input(`Per voucher, TON (now ${fromNano(d.feePerItem)})`)).trim() || fromNano(d.feePerItem));
+            const call = toNano((await ui.input(`Per message, TON (now ${fromNano(d.feePerCall)})`)).trim() || fromNano(d.feePerCall));
+            if (!(await ui.prompt(`Set fees to ${fromNano(item)} per voucher + ${fromNano(call)} per message?`))) return;
+            await minter.sendSetFees(s, item, call);
+            await waitFor(async () => {
+                const x = await minter.getMinterData();
+                return x.feePerItem === item && x.feePerCall === call;
+            }, ui, 'Fees updated.');
             break;
         }
         case 'transfer collection ownership': {
