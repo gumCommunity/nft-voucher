@@ -147,6 +147,18 @@ For a one-off mint: `WALLET_MNEMONIC=... WALLET_VERSION=v4 npx blueprint run min
 Run one `mintPending` at a time and do not mint through the collection in other ways meanwhile: a batch is confirmed by
 `next_item_index` and the kinds of its first and last voucher.
 
+## Deployments
+
+**Mainnet** (2026-11-08, code of `e27603a`):
+
+| Contract | Address | Code hash |
+|---|---|---|
+| collection «Gumcoin Vouchers» | [`EQDuHRGMmO4Ie4lr34yGSDOEYeDbpogKrbDA1uDBO8m1gGEm`](https://tonviewer.com/EQDuHRGMmO4Ie4lr34yGSDOEYeDbpogKrbDA1uDBO8m1gGEm) | `811a47ec…17ba` (item `8544104b…6901`) |
+| minter (owns the collection) | [`EQAlG4MVjNa4S6GVSRlGftGOLDBIpWS0SwUsKLbNQMWG_a1q`](https://tonviewer.com/EQAlG4MVjNa4S6GVSRlGftGOLDBIpWS0SwUsKLbNQMWG_a1q) | `530b25ba…636f` |
+
+Minter admin: `gumcoin.ton`; operator: a separate server wallet; limit 20 vouchers per 24 h; kinds `0.json`, `1.json`, `2.json`.
+Royalty 0%. Vouchers are redeemed by [voucher-redeemer](https://github.com/gumCommunity/voucher-redeemer).
+
 ## Metadata (Gumcoin Vouchers)
 
 Configured in `scripts/voucherConfig.ts`:
