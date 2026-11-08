@@ -2,7 +2,7 @@ import { Blockchain, SandboxContract, TreasuryContract } from '@ton/sandbox';
 import { beginCell, Cell, toNano } from '@ton/core';
 import { compile } from '@ton/blueprint';
 import '@ton/test-utils';
-import { NftVoucherCollection } from '../wrappers/NftVoucherCollection';
+import { CollectionErrors, NftVoucherCollection } from '../wrappers/NftVoucherCollection';
 import { ItemErrors, ItemOpcodes, NftVoucherItem } from '../wrappers/NftVoucherItem';
 
 const VOUCHER = toNano('10');
@@ -38,7 +38,7 @@ describe('NftVoucher', () => {
                     collectionContentUrl: 'https://cdn.gumcoin.org/vouchers/collection.json',
                     commonContentUrl: 'https://cdn.gumcoin.org/vouchers/',
                     nftItemCode: itemCode,
-                    royaltyParams: { royaltyFactor: 0, royaltyBase: 100, royaltyAddress: admin.address },
+                    royaltyParams: { royaltyFactor: 5, royaltyBase: 100, royaltyAddress: admin.address }, // 5% default
                 },
                 collectionCode,
             ),
@@ -225,6 +225,58 @@ describe('NftVoucher', () => {
         expect(old.transactions).toHaveTransaction({ from: admin.address, to: collection.address, success: false, exitCode: 401 });
         await collection.sendMint(bob.getSender(), { itemIndex: 1, itemOwner: alice.address, itemContent: '1.json', voucherValue: toNano('1') });
         expect((await collection.getCollectionData()).nextItemIndex).toBe(2n);
+    });
+
+    it('has 5% royalty by default', async () => {
+        const r = await collection.getRoyaltyParams();
+        expect([r.royaltyFactor, r.royaltyBase]).toEqual([5, 100]);
+        expect(r.royaltyAddress.equals(admin.address)).toBe(true);
+    });
+
+    it('owner changes royalty, metadata URLs stay the same', async () => {
+        const urls = await collection.getContentUrls();
+        expect(urls).toEqual({
+            collectionContentUrl: 'https://cdn.gumcoin.org/vouchers/collection.json',
+            commonContentUrl: 'https://cdn.gumcoin.org/vouchers/',
+        });
+        const res = await collection.sendChangeContent(admin.getSender(), {
+            ...urls,
+            royaltyParams: { royaltyFactor: 25, royaltyBase: 1000, royaltyAddress: bob.address },
+        });
+        expect(res.transactions).toHaveTransaction({ from: admin.address, to: collection.address, success: true });
+
+        const r = await collection.getRoyaltyParams();
+        expect([r.royaltyFactor, r.royaltyBase]).toEqual([25, 1000]);
+        expect(r.royaltyAddress.equals(bob.address)).toBe(true);
+        expect(await collection.getContentUrls()).toEqual(urls);
+        const { content } = await item.getNftData();
+        expect(await collection.getNftContentUrl(0, content!)).toBe('https://cdn.gumcoin.org/vouchers/0.json');
+        // minting keeps working after the change
+        await collection.sendMint(admin.getSender(), { itemIndex: 1, itemOwner: alice.address, itemContent: '2.json', voucherValue: toNano('1') });
+        expect((await collection.getCollectionData()).nextItemIndex).toBe(2n);
+    });
+
+    it('only the owner can change royalty', async () => {
+        const urls = await collection.getContentUrls();
+        const res = await collection.sendChangeContent(bob.getSender(), {
+            ...urls,
+            royaltyParams: { royaltyFactor: 50, royaltyBase: 100, royaltyAddress: bob.address },
+        });
+        expect(res.transactions).toHaveTransaction({ from: bob.address, to: collection.address, success: false, exitCode: CollectionErrors.notOwner });
+        expect((await collection.getRoyaltyParams()).royaltyFactor).toBe(5);
+    });
+
+    it.each([
+        [150, 100],
+        [1, 0],
+    ])('rejects invalid royalty %i/%i', async (factor, base) => {
+        const urls = await collection.getContentUrls();
+        const res = await collection.sendChangeContent(admin.getSender(), {
+            ...urls,
+            royaltyParams: { royaltyFactor: factor, royaltyBase: base, royaltyAddress: admin.address },
+        });
+        expect(res.transactions).toHaveTransaction({ to: collection.address, success: false, exitCode: CollectionErrors.invalidRoyalty });
+        expect((await collection.getRoyaltyParams()).royaltyFactor).toBe(5);
     });
 
     it('only collection owner can mint', async () => {

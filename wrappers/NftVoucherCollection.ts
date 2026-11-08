@@ -39,7 +39,17 @@ export const Opcodes = {
     mint: 1,
     batchMint: 2,
     changeOwner: 3,
+    changeContent: 4, // content + royalty (getgems nft-collection-editable format)
 };
+
+export const CollectionErrors = {
+    notOwner: 401,
+    invalidRoyalty: 410,
+};
+
+export function royaltyParamsToCell(r: RoyaltyParams): Cell {
+    return beginCell().storeUint(r.royaltyFactor, 16).storeUint(r.royaltyBase, 16).storeAddress(r.royaltyAddress).endCell();
+}
 
 export const DEFAULT_ITEM_STORAGE_RESERVE = toNano('0.05');
 
@@ -56,13 +66,7 @@ export function nftVoucherCollectionConfigToCell(config: NftVoucherCollectionCon
         .storeUint(config.nextItemIndex ?? 0, 64)
         .storeRef(buildCollectionContent(config.collectionContentUrl, config.commonContentUrl))
         .storeRef(config.nftItemCode)
-        .storeRef(
-            beginCell()
-                .storeUint(config.royaltyParams.royaltyFactor, 16)
-                .storeUint(config.royaltyParams.royaltyBase, 16)
-                .storeAddress(config.royaltyParams.royaltyAddress)
-                .endCell(),
-        )
+        .storeRef(royaltyParamsToCell(config.royaltyParams))
         .endCell();
 }
 
@@ -148,6 +152,48 @@ export class NftVoucherCollection implements Contract {
             sendMode: SendMode.PAY_GAS_SEPARATELY,
             body: beginCell().storeUint(Opcodes.changeOwner, 32).storeUint(0, 64).storeAddress(newOwner).endCell(),
         });
+    }
+
+    /** Op 4: replace metadata URLs and royalty params at once (owner only). */
+    async sendChangeContent(
+        provider: ContractProvider,
+        via: Sender,
+        opts: { collectionContentUrl: string; commonContentUrl: string; royaltyParams: RoyaltyParams; value?: bigint },
+    ) {
+        await provider.internal(via, {
+            value: opts.value ?? toNano('0.05'),
+            sendMode: SendMode.PAY_GAS_SEPARATELY,
+            body: beginCell()
+                .storeUint(Opcodes.changeContent, 32)
+                .storeUint(0, 64)
+                .storeRef(buildCollectionContent(opts.collectionContentUrl, opts.commonContentUrl))
+                .storeRef(royaltyParamsToCell(opts.royaltyParams))
+                .endCell(),
+        });
+    }
+
+    async getRoyaltyParams(provider: ContractProvider): Promise<RoyaltyParams> {
+        const s = (await provider.get('royalty_params', [])).stack;
+        return { royaltyFactor: s.readNumber(), royaltyBase: s.readNumber(), royaltyAddress: s.readAddress() };
+    }
+
+    /** Current metadata URLs (collection json and the common prefix of item URLs). */
+    async getContentUrls(provider: ContractProvider): Promise<{ collectionContentUrl: string; commonContentUrl: string }> {
+        const c = (await provider.get('get_collection_data', [])).stack;
+        c.readBigNumber();
+        const cs = c.readCell().beginParse();
+        if (cs.loadUint(8) !== 1) throw new Error('Collection content is not off-chain');
+        const collectionContentUrl = cs.loadStringTail();
+        const n = (
+            await provider.get('get_nft_content', [
+                { type: 'int', value: 0n },
+                { type: 'cell', cell: beginCell().endCell() },
+            ])
+        ).stack;
+        const ns = n.readCell().beginParse();
+        ns.loadUint(8);
+        const commonContentUrl = ns.loadBuffer(ns.remainingBits / 8).toString();
+        return { collectionContentUrl, commonContentUrl };
     }
 
     async getCollectionData(provider: ContractProvider) {

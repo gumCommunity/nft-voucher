@@ -2,7 +2,7 @@
 #include "imports/params.fc";
 #include "imports/op-codes.fc";
 
-;; Based on getgems-io/nft-contracts nft-collection.fc (MIT), unchanged logic.
+;; Based on getgems-io/nft-contracts nft-collection.fc (MIT) + op 4 (change content/royalty) from nft-collection-editable.fc.
 ;; NFT collection smart contract
 
 ;; storage scheme
@@ -132,6 +132,18 @@ slice calculate_nft_item_address(int wc, cell state_init) {
     if (op == 3) { ;; change owner
       slice new_owner = in_msg_body~load_msg_addr();
       save_data(new_owner, next_item_index, content, nft_item_code, royalty_params);
+      return ();
+    }
+    if (op == 4) { ;; change content and royalty (same message as getgems nft-collection-editable)
+      cell new_content = in_msg_body~load_ref();
+      cell new_royalty = in_msg_body~load_ref();
+      ;; royalty sanity check: base > 0 and factor <= base (at most 100%), address is std
+      slice rs = new_royalty.begin_parse();
+      int factor = rs~load_uint(16);
+      int base = rs~load_uint(16);
+      rs~load_msg_addr();
+      throw_unless(410, (base > 0) & (factor <= base));
+      save_data(owner_address, next_item_index, new_content, nft_item_code, new_royalty);
       return ();
     }
     throw(0xffff);

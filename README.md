@@ -11,7 +11,7 @@ Burn follows the `destroy` operation of SBT (TEP-85).
 
 | File | Description |
 |---|---|
-| `contracts/nft_voucher_collection.fc` | Getgems collection, logic unchanged: mint (op 1), batch mint (op 2), change owner (op 3), royalty |
+| `contracts/nft_voucher_collection.fc` | Getgems collection: mint (op 1), batch mint (op 2), change owner (op 3), change content/royalty (op 4, as in getgems `nft-collection-editable`, plus a royalty check) |
 | `contracts/nft_voucher_item.fc` | Voucher item, Getgems `nft-item-v2.fc` with the changes below |
 
 ### Differences from Getgems `nft-item-v2`
@@ -31,10 +31,11 @@ The burn does not use flag +32, so the account is not deleted: a burned voucher 
 
 | Code | Meaning |
 |---|---|
-| 401 | sender is not the owner (or the voucher is already burned) |
+| 401 | sender is not the owner (item: also when the voucher is already burned) |
 | 402 | not enough TON attached to `transfer` |
 | 405 | initialization not from the collection |
 | 333 | address is not in workchain 0 |
+| 410 | collection: invalid royalty (base is 0 or more than 100%) |
 | 0xffff | unknown op |
 
 ## Metadata (Gumcoin Vouchers)
@@ -64,6 +65,7 @@ npx blueprint run deployNftVoucherCollection --testnet
 npx blueprint run mintVoucher <collection_address> --testnet   # asks kind, owner and TON value
 npx blueprint run burnVoucher <item_address> --testnet
 npx blueprint run changeCollectionOwner <collection_address> --testnet   # transfer the right to mint
+npx blueprint run changeRoyalty <collection_address> --testnet           # change royalty % and receiver
 ```
 
 From code:
@@ -84,8 +86,12 @@ On mint the item receives `voucherValue + 0.05 TON` (storage reserve). Up to 249
 - If you change `nft_voucher_item.fc`, update the pinned item code in `voucher-redeemer` as well, otherwise the redeemer will not recognise the new items.
 - The collection owner is fully trusted: they mint vouchers and decide how much TON goes into each one.
 - Collection ownership can be transferred with `changeCollectionOwner` (op 3). It is one step and immediate, so the script
-  asks for the new address twice and refuses obviously wrong ones. The royalty address set at deploy does not change
-  (royalty is 0%). The redeemer recognises vouchers by the collection address, so changing the owner does not affect it.
+  asks for the new address twice and refuses obviously wrong ones. The redeemer recognises vouchers by the collection
+  address, so changing the owner does not affect it.
+- **Royalty** is 5% to the deployer by default (`ROYALTY_*` in `scripts/voucherConfig.ts`). The owner can change the percent
+  and the receiver at any time with `changeRoyalty` (op 4 keeps the metadata URLs; the contract rejects more than 100%,
+  error `410`). Royalty is honoured by marketplaces (they read `royalty_params`); direct wallet transfers pay none.
+  Changing the owner does not change the royalty receiver.
 - Test on testnet first and get an audit before mainnet: the NFTs hold real value.
 
 ## License
