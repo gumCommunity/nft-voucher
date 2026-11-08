@@ -1,0 +1,211 @@
+#include "imports/stdlib.fc";
+#include "imports/params.fc";
+#include "imports/op-codes.fc";
+
+;;
+;;  NFT Voucher Item
+;;
+;;  Based on getgems-io/nft-contracts nft-item-v2.fc (MIT) — TEP-62 compatible.
+;;
+;;  Voucher semantics:
+;;    * the TON balance of the item contract IS the voucher value
+;;      (it is funded on mint and can be topped up by anyone with an empty-body transfer);
+;;    * `transfer` never spends the stored value: fees and excesses are paid only
+;;      from the TON attached to the transfer message;
+;;    * `destroy` (burn, op 0x1f04537a as in TEP-85) can be sent only by the owner:
+;;      the whole balance of the item is sent to the owner, and the owner is cleared
+;;      to addr_none, so the item can never be transferred or burned again;
+;;    * `request_voucher_data` (op 0x6d2e6461) returns index, owner and content on-chain,
+;;      so a redeemer contract can find out which voucher kind it has received.
+;;
+
+int min_gas_for_transfer() asm "10000000 PUSHINT"; ;; 0.01 TON — must be attached to a transfer on top of forward amounts/fees
+
+int builder_null?(builder b) asm "ISNULL";
+
+;;
+;;  Storage
+;;
+;;  uint64 index
+;;  MsgAddressInt collection_address
+;;  MsgAddress owner_address   (addr_none after burn)
+;;  cell content
+;;
+
+(int, int, slice, slice, cell) load_data() {
+    slice ds = get_data().begin_parse();
+    var (index, collection_address) = (ds~load_uint(64), ds~load_msg_addr());
+    if (ds.slice_bits() > 0) {
+      return (-1, index, collection_address, ds~load_msg_addr(), ds~load_ref());
+    } else {
+      return (0, index, collection_address, null(), null()); ;; nft not initialized yet
+    }
+}
+
+() store_data(int index, slice collection_address, slice owner_address, cell content) impure {
+    set_data(
+        begin_cell()
+            .store_uint(index, 64)
+            .store_slice(collection_address)
+            .store_slice(owner_address)
+            .store_ref(content)
+            .end_cell()
+    );
+}
+
+() send_msg(slice to_address, int amount, int op, int query_id, builder payload, int send_mode) impure inline {
+  var msg = begin_cell()
+    .store_uint(0x10, 6) ;; nobounce - int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddress -> 011000
+    .store_slice(to_address)
+    .store_coins(amount)
+    .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .store_uint(op, 32)
+    .store_uint(query_id, 64);
+
+  if (~ builder_null?(payload)) {
+    msg = msg.store_builder(payload);
+  }
+
+  send_raw_message(msg.end_cell(), send_mode);
+}
+
+() transfer_ownership(int my_balance, int msg_value, int index, slice collection_address, slice owner_address, cell content, slice sender_address, int query_id, slice in_msg_body, int fwd_fees) impure inline {
+    throw_unless(401, equal_slices(sender_address, owner_address));
+
+    slice new_owner_address = in_msg_body~load_msg_addr();
+    force_chain(new_owner_address);
+    slice response_destination = in_msg_body~load_msg_addr();
+    in_msg_body~load_int(1); ;; this nft don't use custom_payload
+    int forward_amount = in_msg_body~load_coins();
+
+    ;; Everything is paid from the attached value, never from the voucher balance.
+    int required = min_gas_for_transfer();
+    if (forward_amount) {
+      required += forward_amount + fwd_fees;
+    }
+    int need_response = response_destination.preload_uint(2) != 0; ;; if NOT addr_none: 00
+    if (need_response) {
+      required += fwd_fees;
+    }
+    throw_unless(402, msg_value >= required);
+
+    ;; Lock the voucher value (balance before this message). Any outgoing message below
+    ;; that would touch it makes the action phase fail, and the whole transfer is reverted.
+    raw_reserve(my_balance - msg_value, 0);
+
+    if (forward_amount) {
+      send_msg(new_owner_address, forward_amount, op::ownership_assigned(), query_id, begin_cell().store_slice(owner_address).store_slice(in_msg_body), 1);  ;; paying fees, revert on errors
+    }
+    if (need_response) {
+      force_chain(response_destination);
+      send_msg(response_destination, 0, op::excesses(), query_id, null(), 128); ;; all non-reserved balance = what is left of msg_value
+    }
+
+    store_data(index, collection_address, new_owner_address, content);
+}
+
+() destroy(int index, slice collection_address, slice owner_address, cell content, slice sender_address, int query_id) impure inline {
+    throw_unless(401, equal_slices(sender_address, owner_address));
+
+    ;; Whole balance of the item (voucher value + attached TON - fees) goes to the burner.
+    send_msg(sender_address, 0, op::excesses(), query_id, null(), 128);
+
+    store_data(index, collection_address, null_addr(), content);
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { ;; empty messages are accepted as voucher top-ups
+        return ();
+    }
+
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+
+    if (flags & 1) { ;; ignore all bounced messages
+        return ();
+    }
+    slice sender_address = cs~load_msg_addr();
+
+    cs~load_msg_addr(); ;; skip dst
+    cs~load_coins(); ;; skip value
+    cs~skip_bits(1); ;; skip extracurrency collection
+    cs~load_coins(); ;; skip ihr_fee
+    int fwd_fee = muldiv(cs~load_coins(), 3, 2); ;; we use message fwd_fee for estimation of forward_payload costs
+
+
+    (int init?, int index, slice collection_address, slice owner_address, cell content) = load_data();
+    if (~ init?) {
+      throw_unless(405, equal_slices(collection_address, sender_address));
+      var new_owner_address = in_msg_body~load_msg_addr();
+      store_data(index, collection_address, new_owner_address, in_msg_body~load_ref());
+      if (in_msg_body.slice_data_empty?() == false) {
+        var forward_amount = in_msg_body~load_coins();
+        if (forward_amount) {
+          send_msg(new_owner_address, forward_amount, op::ownership_assigned(), 0, begin_cell().store_slice(collection_address).store_slice(in_msg_body), 3); ;; paying fees, ignore errors
+        }
+      }
+      return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+    int query_id = in_msg_body~load_uint(64);
+
+    if (op == op::transfer()) {
+      transfer_ownership(my_balance, msg_value, index, collection_address, owner_address, content, sender_address, query_id, in_msg_body, fwd_fee);
+      return ();
+    }
+    if (op == op::destroy()) {
+      destroy(index, collection_address, owner_address, content, sender_address, query_id);
+      return ();
+    }
+    if (op == op::request_voucher_data()) {
+      ;; Read-only: anyone may ask, the answer always goes back to the sender.
+      ;; The redeemer verifies the reply by recomputing this item's address from `index`.
+      cell payload = in_msg_body~load_ref();
+      cell body = begin_cell()
+          .store_uint(op::report_voucher_data(), 32)
+          .store_uint(query_id, 64)
+          .store_uint(index, 64)
+          .store_slice(owner_address)
+          .store_ref(content)
+          .store_ref(payload)
+          .end_cell();
+      send_raw_message(begin_cell()
+          .store_uint(0x10, 6) ;; nobounce
+          .store_slice(sender_address)
+          .store_coins(0)
+          .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1) ;; body in ref
+          .store_ref(body)
+          .end_cell(), 64); ;; carry the remaining value of the request
+      return ();
+    }
+    if (op == op::get_static_data()) {
+      send_msg(sender_address, 0, op::report_static_data(), query_id, begin_cell().store_uint(index, 256).store_slice(collection_address), 64);  ;; carry all the remaining value of the inbound message
+      return ();
+    }
+    throw(0xffff);
+}
+
+;;
+;;  GET Methods
+;;
+
+(int, int, slice, slice, cell) get_nft_data() method_id {
+  (int init?, int index, slice collection_address, slice owner_address, cell content) = load_data();
+  return (init?, index, collection_address, owner_address, content);
+}
+
+;; -1 if the voucher was burned (owner is addr_none), 0 otherwise
+int is_burned() method_id {
+  (int init?, _, _, slice owner_address, _) = load_data();
+  if (~ init?) {
+    return 0;
+  }
+  return owner_address.preload_uint(2) == 0;
+}
+
+;; current voucher value in nanoTON (the item's balance)
+int get_voucher_value() method_id {
+  var [balance, _] = get_balance();
+  return balance;
+}
